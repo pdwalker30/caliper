@@ -1,0 +1,64 @@
+# ============================================================================
+# LiteLLM Proxy — model routing configuration
+# ============================================================================
+# This file is mounted into the litellm container at /app/config.yaml.
+# Edit this list to add / remove / reroute the models Caliper can target.
+#
+# Each entry:
+#   model_name:      What Caliper / clients call the model (the public alias).
+#   litellm_params:  How LiteLLM routes it upstream.
+#     model:         <vendor_prefix>/<provider_model_id>
+#     api_key:       os.environ/<ENV_VAR_NAME>   — read from container env
+#
+# Reference: https://docs.litellm.ai/docs/proxy/configs
+
+model_list:
+  # ---- OpenAI ---------------------------------------------------------------
+  - model_name: gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+
+  - model_name: gpt-4o-mini
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+
+  # ---- Anthropic ------------------------------------------------------------
+  - model_name: claude-sonnet
+    litellm_params:
+      model: anthropic/claude-sonnet-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  - model_name: claude-haiku
+    litellm_params:
+      model: anthropic/claude-haiku-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+
+  # ---- Google Gemini --------------------------------------------------------
+  - model_name: gemini-pro
+    litellm_params:
+      model: gemini/gemini-1.5-pro
+      api_key: os.environ/GEMINI_API_KEY
+
+  - model_name: gemini-flash
+    litellm_params:
+      model: gemini/gemini-1.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
+litellm_settings:
+  # Drop request params the upstream provider doesn't support, instead of
+  # raising. Useful when one Caliper eval pass targets multiple vendors with
+  # slightly different parameter surfaces.
+  drop_params: true
+  set_verbose: false
+
+  # Light retry default — Caliper's eval runner can override per-call.
+  num_retries: 2
+  request_timeout: 600
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
