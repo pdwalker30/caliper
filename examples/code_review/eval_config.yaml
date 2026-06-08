@@ -65,6 +65,17 @@ iterations: 2
 # Total LLM calls per pass: ~80. At gpt-4o-mini pricing, well under $1.
 
 # ----------------------------------------------------------------------------
+# Concurrency
+# ----------------------------------------------------------------------------
+# Number of Cartesian cells executed in parallel via ThreadPoolExecutor.
+# Default is 10. Raise for faster passes against generous rate limits;
+# set to 1 for serial execution (useful when debugging a flaky provider).
+# Per-cell retry/backoff handles 429s gracefully regardless of concurrency.
+#
+# Override per-run from the CLI:  caliper-eval --concurrency 20 <config>
+concurrency: 10
+
+# ----------------------------------------------------------------------------
 # Optional: extra metadata stamped on every Dataset Run
 # ----------------------------------------------------------------------------
 extra_run_metadata:

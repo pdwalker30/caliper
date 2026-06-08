@@ -220,6 +220,7 @@ models:                              # aliases from litellm_config.yaml
   - "gpt-4o-mini"
   - "claude-haiku"
 iterations: 3                        # per (prompt, model, test_case) cell
+concurrency: 10                      # parallel cells in flight (override via --concurrency N)
 
 human_review:
   enabled: true

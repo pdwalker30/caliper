@@ -19,7 +19,9 @@ comparison view can aggregate them per (prompt, model) run.
 
 from __future__ import annotations
 
+import random
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from itertools import product
 from pathlib import Path
@@ -31,7 +33,6 @@ from langfuse import Langfuse
 from caliper.dataset_bootstrap import bootstrap_dataset, load_test_cases
 from caliper.human_review import (
     LangfuseAnnotationClient,
-    Sampler,
     score_configs_for_rubric,
 )
 from caliper.idempotency import compute_cell_hash, fetch_existing_cell_hashes
@@ -109,7 +110,11 @@ def load_judge_prompt(
 # ---------------------------------------------------------------------------
 
 
-def run_eval(config_path: Path, force: bool = False) -> None:
+def run_eval(
+    config_path: Path,
+    force: bool = False,
+    concurrency_override: int | None = None,
+) -> None:
     """Run one complete eval pass from a YAML EvalConfig.
 
     Idempotent on the Langfuse Dataset (re-runs upsert items, don't duplicate).
@@ -121,9 +126,15 @@ def run_eval(config_path: Path, force: bool = False) -> None:
         force: If True, ignore `config.idempotent` and run every Cartesian cell
             regardless of whether a matching trace already exists. Equivalent
             to setting `idempotent: false` for this one invocation.
+        concurrency_override: If set, overrides `config.concurrency` for this
+            run only. CLI surface for the --concurrency N flag.
     """
     load_dotenv()
     config = load_eval_config(config_path)
+    if concurrency_override is not None:
+        # Mutate post-validation to honor the CLI override without rewriting
+        # the YAML on disk. Pydantic v2 allows attribute assignment by default.
+        config.concurrency = concurrency_override
 
     cfg_dir = config_path.parent
     test_cases_dir = (cfg_dir / config.test_cases_dir).resolve()
@@ -156,7 +167,7 @@ def run_eval(config_path: Path, force: bool = False) -> None:
 
     dataset = langfuse.get_dataset(name=config.dataset_name)
 
-    annotation_client, queue_id, sampler = _maybe_setup_human_review(
+    annotation_client, queue_id = _maybe_setup_human_review(
         config=config, test_cases_dir=test_cases_dir
     )
 
@@ -167,15 +178,106 @@ def run_eval(config_path: Path, force: bool = False) -> None:
     timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     total = len(prompts) * len(config.models) * len(dataset.items) * config.iterations
     print(
-        f"[caliper] running {total} cell(s) "
+        f"[caliper] expanding Cartesian: {total} cell(s) "
         f"({len(prompts)} prompt(s) x {len(config.models)} model(s) x "
         f"{len(dataset.items)} item(s) x {config.iterations} iter(s))"
     )
 
-    counter = 0
+    # Build the work list upfront.
+    # Pre-compute sample flags deterministically (no threaded mutation of Sampler).
+    submissions, skipped = _build_submissions(
+        config=config,
+        prompts=prompts,
+        dataset=dataset,
+        judge_prompt_text=judge_prompt_text,
+        timestamp=timestamp,
+        existing_hashes=existing_hashes,
+        queue_id=queue_id,
+    )
+
+    print(
+        f"[caliper] {len(submissions)} cell(s) to run, {skipped} skipped (idempotent), "
+        f"concurrency={config.concurrency}"
+    )
+
     ran = 0
+    failed: list[tuple[str, str, str, int, str]] = []
+
+    if not submissions:
+        print("[caliper] nothing to do; all cells already exist in this campaign")
+    else:
+        # ThreadPool is correct here: every cell does HTTP I/O (LLM + judge + Langfuse).
+        # The GIL doesn't block I/O-bound work. Shared clients (LiteLLM, Langfuse,
+        # annotation HTTP) are documented thread-safe.
+        with ThreadPoolExecutor(max_workers=config.concurrency) as pool:
+            future_to_sub = {
+                pool.submit(
+                    _run_one_wrapped,
+                    sub=sub,
+                    client=client,
+                    judge=judge,
+                    config=config,
+                    annotation_client=annotation_client,
+                    queue_id=queue_id,
+                ): sub
+                for sub in submissions
+            }
+            for i, future in enumerate(as_completed(future_to_sub), 1):
+                sub = future_to_sub[future]
+                result = future.result()  # never raises — wrapper catches
+                if result["ok"]:
+                    ran += 1
+                    print(
+                        f"[caliper] {i}/{len(submissions)}  OK    "
+                        f"{sub['run_name']} / {sub['item'].id} / iter={sub['iteration'] + 1}  "
+                        f"hash={sub['cell_hash'][:8]}"
+                    )
+                else:
+                    failed.append(
+                        (
+                            sub["run_name"],
+                            sub["item"].id,
+                            sub["model"],
+                            sub["iteration"],
+                            result["error"],
+                        )
+                    )
+                    print(
+                        f"[caliper] {i}/{len(submissions)}  FAIL  "
+                        f"{sub['run_name']} / {sub['item'].id} / iter={sub['iteration'] + 1}  "
+                        f"{result['exc_type']}: {result['error'][:160]}",
+                        file=sys.stderr,
+                    )
+
+    langfuse.flush()
+    if annotation_client is not None:
+        annotation_client.close()
+
+    print()
+    print(f"[caliper] done. ran={ran} skipped={skipped} failed={len(failed)} (of {total})")
+    if failed:
+        print("[caliper] failed cells:")
+        for run_name, item_id, model, iteration, err in failed:
+            print(f"  - {run_name} / {item_id} / iter={iteration} -> {err[:160]}")
+
+
+def _build_submissions(
+    *,
+    config: EvalConfig,
+    prompts: list[tuple[str, str, PromptMetadata]],
+    dataset,
+    judge_prompt_text: str,
+    timestamp: str,
+    existing_hashes: set[str],
+    queue_id: str | None,
+) -> tuple[list[dict], int]:
+    """Expand the Cartesian into a list of submission dicts, pre-computing
+    sample flags so the parallel section has no contended state.
+
+    Returns (submissions_to_run, skipped_count).
+    """
     skipped = 0
-    failed: list[tuple[str, str, str, int, str]] = []  # (run_name, item.id, model, iter, error)
+    by_run: dict[str, list[dict]] = {}
 
     for (prompt_id, prompt_text, prompt_meta), model in product(prompts, config.models):
         run_name = f"{config.name}__{prompt_id}__{model}__{timestamp}"
@@ -194,7 +296,6 @@ def run_eval(config_path: Path, force: bool = False) -> None:
             test_case_meta = TestCaseMetadata.model_validate(item.metadata)
 
             for iteration in range(config.iterations):
-                counter += 1
                 cell_hash = compute_cell_hash(
                     campaign=config.name,
                     prompt_text=prompt_text,
@@ -209,54 +310,85 @@ def run_eval(config_path: Path, force: bool = False) -> None:
 
                 if cell_hash in existing_hashes:
                     skipped += 1
-                    print(
-                        f"[caliper] {counter}/{total}  SKIP (idempotent)  "
-                        f"hash={cell_hash[:8]}  item={item.id}  iter={iteration + 1}"
-                    )
                     continue
 
-                print(
-                    f"[caliper] {counter}/{total}  run={run_name}  "
-                    f"item={item.id}  iter={iteration + 1}  hash={cell_hash[:8]}"
+                by_run.setdefault(run_name, []).append(
+                    {
+                        "run_name": run_name,
+                        "run_metadata": run_metadata,
+                        "prompt_text": prompt_text,
+                        "prompt_id": prompt_id,
+                        "model": model,
+                        "iteration": iteration,
+                        "item": item,
+                        "test_case_meta": test_case_meta,
+                        "cell_hash": cell_hash,
+                        "should_sample": False,  # filled in below
+                    }
                 )
-                try:
-                    _run_one(
-                        item=item,
-                        run_name=run_name,
-                        run_metadata=run_metadata,
-                        prompt_text=prompt_text,
-                        prompt_id=prompt_id,
-                        model=model,
-                        iteration=iteration,
-                        test_case_meta=test_case_meta,
-                        client=client,
-                        judge=judge,
-                        config=config,
-                        annotation_client=annotation_client,
-                        queue_id=queue_id,
-                        sampler=sampler,
-                        cell_hash=cell_hash,
-                    )
-                    ran += 1
-                except Exception as e:
-                    # Per-cell failure isolation: log + carry on. One bad cell
-                    # must NOT abort the matrix — that wastes everything done so far.
-                    failed.append((run_name, item.id, model, iteration, str(e)))
-                    print(
-                        f"[caliper] {counter}/{total}  FAIL  {type(e).__name__}: {e}",
-                        file=sys.stderr,
-                    )
 
-    langfuse.flush()
-    if annotation_client is not None:
-        annotation_client.close()
+    # Pre-compute sample flags (deterministic; no threaded mutation).
+    if (
+        config.human_review
+        and config.human_review.enabled
+        and queue_id is not None
+    ):
+        strategy = config.human_review.sample_strategy
+        rng = random.Random(0xC4117E5)
+        for run_subs in by_run.values():
+            if strategy == "all":
+                for s in run_subs:
+                    s["should_sample"] = True
+            elif strategy == "stratified":
+                n = config.human_review.samples_per_run
+                for s in run_subs[:n]:
+                    s["should_sample"] = True
+            elif strategy == "random":
+                for s in run_subs:
+                    s["should_sample"] = rng.random() < config.human_review.sample_rate
 
-    print()
-    print(f"[caliper] done. ran={ran} skipped={skipped} failed={len(failed)} (of {total})")
-    if failed:
-        print("[caliper] failed cells:")
-        for run_name, item_id, model, iteration, err in failed:
-            print(f"  - {run_name} / {item_id} / iter={iteration} -> {err[:160]}")
+    submissions: list[dict] = []
+    for run_subs in by_run.values():
+        submissions.extend(run_subs)
+    return submissions, skipped
+
+
+def _run_one_wrapped(
+    *,
+    sub: dict,
+    client: LiteLLMProxyClient,
+    judge: RubricJudge,
+    config: EvalConfig,
+    annotation_client: LangfuseAnnotationClient | None,
+    queue_id: str | None,
+) -> dict:
+    """Run one cell inside a worker thread. Never raises — wraps the result.
+
+    Per-cell isolation: an exception from _run_one becomes a dict result that
+    the main thread aggregates into the failed list. The thread pool keeps
+    running other cells regardless.
+    """
+    try:
+        _run_one(
+            item=sub["item"],
+            run_name=sub["run_name"],
+            run_metadata=sub["run_metadata"],
+            prompt_text=sub["prompt_text"],
+            prompt_id=sub["prompt_id"],
+            model=sub["model"],
+            iteration=sub["iteration"],
+            test_case_meta=sub["test_case_meta"],
+            client=client,
+            judge=judge,
+            config=config,
+            annotation_client=annotation_client,
+            queue_id=queue_id,
+            should_sample=sub["should_sample"],
+            cell_hash=sub["cell_hash"],
+        )
+        return {"ok": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e), "exc_type": type(e).__name__}
 
 
 def _maybe_fetch_existing_hashes(*, config: EvalConfig, force: bool) -> set[str]:
@@ -300,20 +432,20 @@ def _maybe_setup_human_review(
     *,
     config: EvalConfig,
     test_cases_dir: Path,
-) -> tuple[LangfuseAnnotationClient | None, str | None, Sampler | None]:
+) -> tuple[LangfuseAnnotationClient | None, str | None]:
     """Set up human-review queue + score configs if configured.
 
     Never fails the eval pass. On any error, prints a WARN to stderr and
-    returns (None, None, None) — the runner will proceed without enqueueing.
+    returns (None, None) — the runner will proceed without enqueueing.
     """
     if not config.human_review or not config.human_review.enabled:
-        return None, None, None
+        return None, None
 
     try:
         client = LangfuseAnnotationClient.from_env()
     except Exception as e:
         print(f"[caliper] WARN: human review setup skipped — {e}", file=sys.stderr)
-        return None, None, None
+        return None, None
 
     try:
         cases = load_test_cases(test_cases_dir)
@@ -325,7 +457,7 @@ def _maybe_setup_human_review(
             file=sys.stderr,
         )
         client.close()
-        return None, None, None
+        return None, None
 
     queue_id: str | None = None
     if config.human_review.auto_create:
@@ -364,8 +496,7 @@ def _maybe_setup_human_review(
                 file=sys.stderr,
             )
 
-    sampler = Sampler(config.human_review) if queue_id else None
-    return client, queue_id, sampler
+    return client, queue_id
 
 
 def _run_one(
@@ -383,7 +514,7 @@ def _run_one(
     config: EvalConfig,
     annotation_client: LangfuseAnnotationClient | None = None,
     queue_id: str | None = None,
-    sampler: Sampler | None = None,
+    should_sample: bool = False,
     cell_hash: str = "",
 ) -> None:
     """Single (prompt, model, item, iteration) trace.
@@ -492,25 +623,17 @@ def _run_one(
         )
 
         # ----- 4. Optional: enqueue for human review -----
-        if (
-            annotation_client is not None
-            and queue_id is not None
-            and sampler is not None
-        ):
-            if sampler.should_sample(
-                run_name=run_name,
-                item_id=item.id,
-                iteration=iteration,
-                overall_score=verdict.overall_value,
-            ):
-                try:
-                    annotation_client.add_trace_to_queue(
-                        queue_id=queue_id,
-                        trace_id=parent.trace_id,
-                    )
-                except Exception as e:
-                    print(
-                        f"[caliper] WARN: failed to enqueue trace {parent.trace_id} "
-                        f"for human review: {e}",
-                        file=sys.stderr,
-                    )
+        # should_sample was pre-computed in _build_submissions so the parallel
+        # section has no contended Sampler state.
+        if should_sample and annotation_client is not None and queue_id is not None:
+            try:
+                annotation_client.add_trace_to_queue(
+                    queue_id=queue_id,
+                    trace_id=parent.trace_id,
+                )
+            except Exception as e:
+                print(
+                    f"[caliper] WARN: failed to enqueue trace {parent.trace_id} "
+                    f"for human review: {e}",
+                    file=sys.stderr,
+                )

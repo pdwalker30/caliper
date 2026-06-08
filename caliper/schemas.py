@@ -193,6 +193,12 @@ class EvalConfig(BaseModel):
     judge_model: str
     models: list[str] = Field(min_length=1)
     iterations: int = Field(ge=1, default=1)
+    # Number of Cartesian cells executed concurrently. Each cell does 2 LLM
+    # calls (model under test + judge) so wall-clock speed-up is ~Nx for an
+    # N-worker pool, up to provider rate limits. The retry block above will
+    # back off on 429s — concurrency interacts cleanly with that.
+    # Cap at 1 to force serial execution; raise for faster passes.
+    concurrency: int = Field(ge=1, default=10)
     extra_run_metadata: dict[str, Any] = Field(default_factory=dict)
     human_review: HumanReviewConfig | None = None
     retry: RetryConfig = Field(default_factory=RetryConfig)
