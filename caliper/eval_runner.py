@@ -203,6 +203,10 @@ def _run_one(
         run_metadata=run_metadata,
         run_description=f"Caliper eval pass: {config.name}",
     ) as parent:
+        # Tags are how cross-cutting Trace-view filters work — they let you
+        # ask questions that span Runs (e.g. "show every trace that scored
+        # poorly on snippet X regardless of which combo produced it").
+        # Run-level questions stay in run_metadata; per-trace questions in tags.
         parent.update(
             input={
                 "prompt": prompt_text,
@@ -212,9 +216,19 @@ def _run_one(
             tags=[
                 f"prompt:{prompt_id}",
                 f"model:{model}",
+                f"code_snippet:{item.id}",
+                f"iteration:{iteration}",
                 f"eval_type:{test_case_meta.eval_type}",
                 f"campaign:{config.name}",
             ],
+            metadata={
+                "prompt_id": prompt_id,
+                "model": model,
+                "code_snippet": item.id,
+                "iteration": iteration,
+                "eval_type": test_case_meta.eval_type,
+                "campaign": config.name,
+            },
         )
 
         # ----- 1. The model under test -----
