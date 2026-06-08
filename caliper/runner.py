@@ -34,6 +34,7 @@ from caliper.human_review import (
     Sampler,
     score_configs_for_rubric,
 )
+from caliper.idempotency import compute_cell_hash, fetch_existing_cell_hashes
 from caliper.judges.rubric_judge import RubricJudge
 from caliper.litellm_client import LiteLLMProxyClient
 from caliper.schemas import (
@@ -93,12 +94,18 @@ def load_judge_prompt(
 # ---------------------------------------------------------------------------
 
 
-def run_eval(config_path: Path) -> None:
+def run_eval(config_path: Path, force: bool = False) -> None:
     """Run one complete eval pass from a YAML EvalConfig.
 
     Idempotent on the Langfuse Dataset (re-runs upsert items, don't duplicate).
     Each invocation produces a fresh timestamp-tagged Dataset Run per
     (prompt, model) combo so eval cycles don't collide.
+
+    Args:
+        config_path: Path to the YAML EvalConfig.
+        force: If True, ignore `config.idempotent` and run every Cartesian cell
+            regardless of whether a matching trace already exists. Equivalent
+            to setting `idempotent: false` for this one invocation.
     """
     load_dotenv()
     config = load_eval_config(config_path)
@@ -109,7 +116,7 @@ def run_eval(config_path: Path) -> None:
     judge_prompts_dir = (cfg_dir / config.judge_prompts_dir).resolve()
 
     langfuse = Langfuse()
-    client = LiteLLMProxyClient()
+    client = LiteLLMProxyClient(retry_config=config.retry)
 
     print(f"[caliper] bootstrapping dataset {config.dataset_name!r} from {test_cases_dir}")
     n_items = bootstrap_dataset(
@@ -138,15 +145,23 @@ def run_eval(config_path: Path) -> None:
         config=config, test_cases_dir=test_cases_dir
     )
 
+    # Hash-based idempotency: fetch existing cell hashes for this campaign upfront.
+    # In-memory set check during the loop -> zero per-cell Langfuse calls.
+    existing_hashes = _maybe_fetch_existing_hashes(config=config, force=force)
+
     timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     total = len(prompts) * len(config.models) * len(dataset.items) * config.iterations
     print(
-        f"[caliper] running {total} traces "
+        f"[caliper] running {total} cell(s) "
         f"({len(prompts)} prompt(s) x {len(config.models)} model(s) x "
         f"{len(dataset.items)} item(s) x {config.iterations} iter(s))"
     )
 
     counter = 0
+    ran = 0
+    skipped = 0
+    failed: list[tuple[str, str, str, int, str]] = []  # (run_name, item.id, model, iter, error)
+
     for (prompt_id, prompt_text, prompt_meta), model in product(prompts, config.models):
         run_name = f"{config.name}__{prompt_id}__{model}__{timestamp}"
         run_metadata = {
@@ -165,31 +180,105 @@ def run_eval(config_path: Path) -> None:
 
             for iteration in range(config.iterations):
                 counter += 1
+                cell_hash = compute_cell_hash(
+                    campaign=config.name,
+                    prompt_text=prompt_text,
+                    judge_prompt_text=judge_prompt_text,
+                    model=model,
+                    judge_model=config.judge_model,
+                    snippet_content=item.input["content"],
+                    expected=test_case_meta.expected,
+                    rubric=test_case_meta.rubric.model_dump(),
+                    iteration=iteration,
+                )
+
+                if cell_hash in existing_hashes:
+                    skipped += 1
+                    print(
+                        f"[caliper] {counter}/{total}  SKIP (idempotent)  "
+                        f"hash={cell_hash[:8]}  item={item.id}  iter={iteration + 1}"
+                    )
+                    continue
+
                 print(
                     f"[caliper] {counter}/{total}  run={run_name}  "
-                    f"item={item.id}  iter={iteration + 1}"
+                    f"item={item.id}  iter={iteration + 1}  hash={cell_hash[:8]}"
                 )
-                _run_one(
-                    item=item,
-                    run_name=run_name,
-                    run_metadata=run_metadata,
-                    prompt_text=prompt_text,
-                    prompt_id=prompt_id,
-                    model=model,
-                    iteration=iteration,
-                    test_case_meta=test_case_meta,
-                    client=client,
-                    judge=judge,
-                    config=config,
-                    annotation_client=annotation_client,
-                    queue_id=queue_id,
-                    sampler=sampler,
-                )
+                try:
+                    _run_one(
+                        item=item,
+                        run_name=run_name,
+                        run_metadata=run_metadata,
+                        prompt_text=prompt_text,
+                        prompt_id=prompt_id,
+                        model=model,
+                        iteration=iteration,
+                        test_case_meta=test_case_meta,
+                        client=client,
+                        judge=judge,
+                        config=config,
+                        annotation_client=annotation_client,
+                        queue_id=queue_id,
+                        sampler=sampler,
+                        cell_hash=cell_hash,
+                    )
+                    ran += 1
+                except Exception as e:
+                    # Per-cell failure isolation: log + carry on. One bad cell
+                    # must NOT abort the matrix — that wastes everything done so far.
+                    failed.append((run_name, item.id, model, iteration, str(e)))
+                    print(
+                        f"[caliper] {counter}/{total}  FAIL  {type(e).__name__}: {e}",
+                        file=sys.stderr,
+                    )
 
     langfuse.flush()
     if annotation_client is not None:
         annotation_client.close()
-    print(f"[caliper] done. {counter} trace(s) written to Langfuse.")
+
+    print()
+    print(f"[caliper] done. ran={ran} skipped={skipped} failed={len(failed)} (of {total})")
+    if failed:
+        print("[caliper] failed cells:")
+        for run_name, item_id, model, iteration, err in failed:
+            print(f"  - {run_name} / {item_id} / iter={iteration} -> {err[:160]}")
+
+
+def _maybe_fetch_existing_hashes(*, config: EvalConfig, force: bool) -> set[str]:
+    """Fetch the set of cell hashes already present in this campaign's traces.
+
+    Returns an empty set when idempotency is disabled or force=True.
+    Best-effort: if the upfront fetch fails for any reason, log a WARN and
+    return an empty set — the eval pass proceeds as if no prior runs existed.
+    """
+    if not config.idempotent:
+        return set()
+    if force:
+        print("[caliper] --force: ignoring idempotent setting for this run")
+        return set()
+
+    try:
+        client = LangfuseAnnotationClient.from_env()
+    except Exception as e:
+        print(
+            f"[caliper] WARN: idempotency disabled ({e}); proceeding without skip check",
+            file=sys.stderr,
+        )
+        return set()
+
+    try:
+        print(f"[caliper] fetching existing cell hashes for campaign {config.name!r}")
+        hashes = fetch_existing_cell_hashes(client, config.name)
+        print(f"[caliper] {len(hashes)} existing cell(s) on record")
+        return hashes
+    except Exception as e:
+        print(
+            f"[caliper] WARN: idempotency lookup failed ({e}); proceeding without skip check",
+            file=sys.stderr,
+        )
+        return set()
+    finally:
+        client.close()
 
 
 def _maybe_setup_human_review(
@@ -280,6 +369,7 @@ def _run_one(
     annotation_client: LangfuseAnnotationClient | None = None,
     queue_id: str | None = None,
     sampler: Sampler | None = None,
+    cell_hash: str = "",
 ) -> None:
     """Single (prompt, model, item, iteration) trace.
 
@@ -295,28 +385,36 @@ def _run_one(
         run_metadata=run_metadata,
         run_description=f"Caliper eval pass: {config.name}",
     ) as parent:
+        # cell_hash tag is what idempotency checks against on later runs.
+        # Stamp it both as a tag (for fast filter) and in metadata (for query).
+        tags = [
+            f"prompt:{prompt_id}",
+            f"model:{model}",
+            f"code_snippet:{item.id}",
+            f"iteration:{iteration}",
+            f"eval_type:{test_case_meta.eval_type}",
+            f"campaign:{config.name}",
+        ]
+        metadata: dict[str, object] = {
+            "prompt_id": prompt_id,
+            "model": model,
+            "code_snippet": item.id,
+            "iteration": iteration,
+            "eval_type": test_case_meta.eval_type,
+            "campaign": config.name,
+        }
+        if cell_hash:
+            tags.append(f"cell_hash:{cell_hash}")
+            metadata["cell_hash"] = cell_hash
+
         parent.update(
             input={
                 "prompt": prompt_text,
                 "test_case": item.input,
                 "iteration": iteration,
             },
-            tags=[
-                f"prompt:{prompt_id}",
-                f"model:{model}",
-                f"code_snippet:{item.id}",
-                f"iteration:{iteration}",
-                f"eval_type:{test_case_meta.eval_type}",
-                f"campaign:{config.name}",
-            ],
-            metadata={
-                "prompt_id": prompt_id,
-                "model": model,
-                "code_snippet": item.id,
-                "iteration": iteration,
-                "eval_type": test_case_meta.eval_type,
-                "campaign": config.name,
-            },
+            tags=tags,
+            metadata=metadata,
         )
 
         # ----- 1. The model under test -----

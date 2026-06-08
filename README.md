@@ -21,13 +21,14 @@ caliper/                            ← framework (importable library)
 ├── calibration.py                  agreement metrics (MAE, r, ρ, κ)
 ├── diagnostics.py                  stack readiness probes
 ├── dataset_bootstrap.py            folder → Langfuse Dataset
-├── litellm_client.py               proxy client
+├── litellm_client.py               proxy client with retry/backoff
+├── idempotency.py                  hash-based cell skip logic
 ├── human_review.py                 annotation queue + score config HTTP client
 ├── judges/
 │   ├── base.py                     JudgeAdapter protocol
 │   └── rubric_judge.py             generic LLM-as-judge driven by metadata
 └── cli/                            ← CLI shims (thin entry points, no logic)
-    ├── eval.py                     caliper-eval
+    ├── eval.py                     caliper-eval [--force]
     ├── calibrate.py                caliper-calibrate
     └── check.py                    caliper-check
 
@@ -226,6 +227,25 @@ human_review:
   sample_strategy: stratified        # or "random" | "all"
   samples_per_run: 2
   auto_create: true                  # try REST-API to create queue + configs
+
+# Retry / backoff for every LLM call (model under test AND judge).
+# Defaults are tuned for typical hosted-LLM rate limits.
+retry:
+  max_attempts: 5
+  initial_wait_seconds: 2.0
+  max_wait_seconds: 60.0
+  exponential_base: 2.0
+  jitter_seconds: 1.0
+  retry_on_statuses: [408, 425, 429, 500, 502, 503, 504]
+
+# Hash-based opt-in idempotency. When true, Caliper computes a SHA-256 hash
+# per Cartesian cell over (campaign, prompt text, judge prompt text, model,
+# judge model, snippet content, expected, rubric, iteration) and skips any
+# cell whose hash already appears on a trace in this campaign.
+#
+# Edit a prompt -> hash changes -> cell re-runs. No version field to bump.
+# Override for one run with: caliper-eval --force <config.yaml>
+idempotent: false
 ```
 
 `extra_run_metadata` (optional) lets you stamp every Dataset Run with
@@ -314,6 +334,53 @@ The judge model isn't producing parseable JSON. Two likely fixes:
 2. **Tighten the judge prompt.** The default template asks for JSON;
    include an explicit `"You MUST return ONLY a JSON object matching this
    schema: {...}"` line.
+
+### Eval pass is hitting rate limits (HTTP 429) repeatedly
+
+Caliper retries every LLM call automatically with exponential backoff + jitter
+per the `retry:` config block. If you're seeing sustained 429s in the
+retry-progress lines on stderr, you're hitting a real quota wall — bump
+`retry.max_attempts` and `retry.max_wait_seconds`, or use a cheaper / lower-
+tier model for the matrix's first cycle, or batch your eval over multiple
+shorter passes. Single 429s with successful retries are healthy and expected.
+
+### Eval pass skipped lots of cells — am I missing data?
+
+The end-of-pass summary line is `ran=X skipped=Y failed=Z`. If `skipped` is
+non-zero, you have `idempotent: true` in your config and Caliper found
+existing traces with matching cell hashes. That's intentional — you're not
+missing data, you're re-using prior runs.
+
+To force a fresh pass without editing the config: `caliper-eval --force <config>`.
+To verify what the hash protects: check `metadata.cell_hash` on existing
+traces in Langfuse UI.
+
+### I edited prompt.txt but Caliper still skipped some cells
+
+That's a real bug — hash-based idempotency should detect any change in
+`prompt.txt`. Verify:
+
+1. The file you edited is actually under `prompts/<prompt_id>/prompt.txt`
+   in the folder referenced by `eval_config.yaml: prompts_dir`.
+2. The change is saved (no editor buffer / encoding issue).
+3. The campaign name in your config matches the existing traces' campaign tag.
+
+If all three check out and you're still getting unexpected skips, run with
+`--force` to confirm fresh runs work, then file an issue with the prompt
+file's SHA-256 + the trace's `metadata.cell_hash` so the hash compute can
+be debugged.
+
+### A single cell failed (FAIL in the matrix) — what happens next?
+
+The matrix continues. Per-cell failure isolation: one cell exhausting retries
+or hitting an unrecoverable error gets logged and skipped. The end-of-pass
+summary lists every failed cell with the error message. The other cells
+complete normally — you don't waste 80 cells' worth of API calls because
+cell #41 had a transient issue.
+
+To re-run only the failed cells later: set `idempotent: true`, leave the
+successful traces in place, re-run. Caliper will skip the successful cells
+(hashes match) and re-attempt only the missing ones.
 
 ### Eval pass burns a lot of API budget unexpectedly
 

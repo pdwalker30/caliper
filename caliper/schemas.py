@@ -122,6 +122,29 @@ class JudgeVerdict(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class RetryConfig(BaseModel):
+    """Retry / backoff for LLM calls through the LiteLLM proxy.
+
+    Applied to every model-under-test call AND every judge call. Default values
+    are tuned for typical hosted-LLM rate limits — sustained 429s back off
+    to ~60s waits within 5 attempts, which is enough to clear most quota
+    refreshes without giving up on the call.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_attempts: int = Field(ge=1, default=5)
+    initial_wait_seconds: float = Field(ge=0, default=2.0)
+    max_wait_seconds: float = Field(ge=0, default=60.0)
+    exponential_base: float = Field(ge=1, default=2.0)
+    jitter_seconds: float = Field(ge=0, default=1.0)
+    # Status codes that trigger a retry. 429 is rate-limit; 5xx is upstream
+    # transient. 408 / 425 also worth retrying on if your provider returns them.
+    retry_on_statuses: list[int] = Field(
+        default_factory=lambda: [408, 425, 429, 500, 502, 503, 504]
+    )
+
+
 class HumanReviewConfig(BaseModel):
     """Optional human-in-the-loop calibration of the LLM judge.
 
@@ -172,3 +195,10 @@ class EvalConfig(BaseModel):
     iterations: int = Field(ge=1, default=1)
     extra_run_metadata: dict[str, Any] = Field(default_factory=dict)
     human_review: HumanReviewConfig | None = None
+    retry: RetryConfig = Field(default_factory=RetryConfig)
+    # Opt-in idempotency: when True, Caliper computes a hash per Cartesian cell
+    # (campaign + prompt text + judge prompt text + model + judge model + snippet
+    # content + expected + rubric + iteration) and skips any cell whose hash
+    # already appears on a trace in this campaign. Edit a prompt -> hash changes
+    # -> cell re-runs. No version bumping required.
+    idempotent: bool = False
