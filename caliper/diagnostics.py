@@ -1,23 +1,18 @@
-"""Caliper stack readiness probe.
+"""Stack readiness probes — library entry points.
 
-Run BEFORE an eval pass to verify the full dependency chain is reachable
-and configured correctly. Prints PASS/WARN/FAIL per check with reasons so
-you can fix issues before burning LLM API budget on a doomed run.
-
-    python -m caliper.check_stack                       # probe everything default
-    python -m caliper.check_stack path/to/eval_config.yaml  # also probe config-specific items
+Each probe returns a CheckResult (status + detail). `run_checks(config_path)`
+runs the full battery and returns the list. The CLI shim that prints the
+human-readable summary lives in `caliper.cli.check`.
 """
 
 from __future__ import annotations
 
 import os
-import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
 import yaml
-from dotenv import load_dotenv
 
 from caliper.human_review import (
     LangfuseAnnotationClient,
@@ -74,7 +69,7 @@ def probe_langfuse_auth() -> CheckResult:
     try:
         client = LangfuseAnnotationClient.from_env()
         try:
-            _ = client.list_score_configs()  # cheap call that requires auth
+            _ = client.list_score_configs()
             return CheckResult(
                 "Langfuse credentials",
                 "PASS",
@@ -154,7 +149,7 @@ def probe_eval_config_paths(config_path: Path) -> list[CheckResult]:
     return results
 
 
-def probe_human_review(config: EvalConfig) -> list[CheckResult]:
+def probe_human_review(config: EvalConfig, config_path: Path) -> list[CheckResult]:
     if not config.human_review or not config.human_review.enabled:
         return [
             CheckResult(
@@ -172,14 +167,15 @@ def probe_human_review(config: EvalConfig) -> list[CheckResult]:
         return results
 
     try:
-        # Score configs for first test case's rubric (POC assumption: all rubrics share dims)
         from caliper.dataset_bootstrap import load_test_cases
 
-        cfg_dir = Path(".")  # set externally before calling; passed from caller in main()
-        cases = load_test_cases(Path(config.test_cases_dir))
+        test_cases_dir = (config_path.parent / config.test_cases_dir).resolve()
+        cases = load_test_cases(test_cases_dir)
         if not cases:
             results.append(
-                CheckResult("Rubric available for queue check", "FAIL", "No test cases loaded")
+                CheckResult(
+                    "Rubric available for queue check", "FAIL", "No test cases loaded"
+                )
             )
             return results
         rubric = cases[0][2].rubric
@@ -197,10 +193,11 @@ def probe_human_review(config: EvalConfig) -> list[CheckResult]:
             )
         else:
             results.append(
-                CheckResult("Score configs exist", "PASS", f"{len(specs)} configs present")
+                CheckResult(
+                    "Score configs exist", "PASS", f"{len(specs)} configs present"
+                )
             )
 
-        # Queue
         queue = client.find_queue(config.human_review.queue_name)
         if queue:
             results.append(
@@ -226,11 +223,13 @@ def probe_human_review(config: EvalConfig) -> list[CheckResult]:
 
 
 # ---------------------------------------------------------------------------
-# CLI
+# Aggregate runner
 # ---------------------------------------------------------------------------
 
 
 def run_checks(config_path: Path | None) -> list[CheckResult]:
+    """Run the full probe battery. Pass `config_path` to also probe config-
+    specific items (asset folders, score configs, queue lookup)."""
     results: list[CheckResult] = []
     results.append(probe_langfuse_reachable())
     results.append(probe_langfuse_auth())
@@ -241,41 +240,7 @@ def run_checks(config_path: Path | None) -> list[CheckResult]:
         try:
             with config_path.open(encoding="utf-8") as f:
                 config = EvalConfig.model_validate(yaml.safe_load(f))
-            results.extend(probe_human_review(config))
+            results.extend(probe_human_review(config, config_path))
         except Exception:
-            # parse failure already surfaced above
             pass
     return results
-
-
-def print_summary(results: list[CheckResult]) -> int:
-    print()
-    print("=" * 72)
-    print("CALIPER STACK READINESS PROBE")
-    print("=" * 72)
-    width = max(len(r.name) for r in results)
-    for r in results:
-        symbol = {"PASS": "PASS", "WARN": "WARN", "FAIL": "FAIL"}[r.status]
-        print(f"  [{symbol}]  {r.name.ljust(width)}  {r.detail}")
-    fails = sum(1 for r in results if r.status == "FAIL")
-    warns = sum(1 for r in results if r.status == "WARN")
-    print()
-    if fails:
-        print(f"{fails} FAIL, {warns} WARN. Fix FAILs before running eval_runner.")
-        return 1
-    if warns:
-        print(f"All probes passed; {warns} WARN(s) — see details above.")
-        return 0
-    print("All probes passed cleanly. You're ready to run an eval pass.")
-    return 0
-
-
-def main() -> None:
-    load_dotenv()
-    config_path = Path(sys.argv[1]) if len(sys.argv) >= 2 else None
-    results = run_checks(config_path)
-    sys.exit(print_summary(results))
-
-
-if __name__ == "__main__":
-    main()

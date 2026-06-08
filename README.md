@@ -3,113 +3,327 @@
 A generic, metadata-driven LLM evaluation framework.
 
 Caliper runs the Cartesian product of `(prompt × model × test_case × iteration)`,
-sends each output to a configurable judge, and writes structured traces +
-per-dimension scores to [Langfuse](https://langfuse.com) — so the
-"which prompt/model combo wins?" question has an out-of-the-box answer.
+sends each output to a configurable LLM judge, optionally samples a slice for
+human calibration via [Langfuse](https://langfuse.com) Annotation Queues, and
+reports human-vs-LLM judge agreement so you know how much to trust the LLM
+judge before you run it at scale.
 
-## Status
+**Status:** early development. Not yet ready for general use.
 
-Early development. Not yet ready for general use.
+---
+
+## What's in the box
+
+```
+caliper/                            ← framework (importable library)
+├── schemas.py                      Pydantic data contracts
+├── runner.py                       run_eval()  — the Cartesian loop
+├── calibration.py                  agreement metrics (MAE, r, ρ, κ)
+├── diagnostics.py                  stack readiness probes
+├── dataset_bootstrap.py            folder → Langfuse Dataset
+├── litellm_client.py               proxy client
+├── human_review.py                 annotation queue + score config HTTP client
+├── judges/
+│   ├── base.py                     JudgeAdapter protocol
+│   └── rubric_judge.py             generic LLM-as-judge driven by metadata
+└── cli/                            ← CLI shims (thin entry points, no logic)
+    ├── eval.py                     caliper-eval
+    ├── calibrate.py                caliper-calibrate
+    └── check.py                    caliper-check
+
+docs/
+└── human-review-setup.md           full setup guide + manual UI fallback
+
+examples/
+└── code_review/                    sample folder layout (M4)
+    ├── code_snippets/
+    ├── prompts/
+    ├── judge_prompts/
+    └── eval_config.yaml
+
+scripts/
+└── generate-secrets.sh             one-shot generator for Langfuse secrets
+
+docker-compose.yml                  Langfuse v3 self-hosted + LiteLLM proxy
+litellm_config.yaml                 model routing config (edit to add vendors)
+.env.example                        every env var, documented
+```
+
+---
+
+## The four phases
+
+Caliper splits evaluation work into four discrete phases. **Phase 1 is one-time
+setup per environment. Phases 2-4 are the recurring eval cycle.**
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│  Phase 1: Setup           (once per env, framework-assisted)        │
+│  Phase 2: Eval pass       (per cycle, framework)                    │
+│  Phase 3: Human review    (per cycle, humans in Langfuse UI)        │
+│  Phase 4: Calibration     (per cycle, framework)                    │
+└──────────────────────────────────────────────────────────────────────┘
+```
+
+### Phase 1 — Setup (one-time per environment)
+
+Bring up the stack, create accounts/keys, install Caliper, verify it can
+reach everything.
+
+```bash
+# 1a. Generate secrets and fill in .env
+cp .env.example .env
+./scripts/generate-secrets.sh        # prints values — copy into .env
+# Edit .env, add upstream LLM API keys (OPENAI_API_KEY, ANTHROPIC_API_KEY, ...)
+
+# 1b. Bring up the stack
+docker compose up -d
+docker compose ps                    # all services should report "healthy"
+
+# 1c. Open http://localhost:3000 in a browser
+#     - Sign up (local-only account)
+#     - Create a project
+#     - Settings -> API Keys -> Create new key
+#     - Paste public + secret keys into .env as LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY
+
+# 1d. Install Caliper
+python -m venv .venv
+source .venv/bin/activate            # Windows: .venv\Scripts\activate
+pip install -e ".[dev]"
+
+# 1e. Sanity-check the whole stack
+caliper-check examples/code_review/eval_config.yaml
+```
+
+Expect to see a clean readiness report:
+
+```
+[PASS]  Langfuse reachable     http://localhost:3000 responded 200
+[PASS]  Langfuse credentials   Basic auth accepted on REST API
+[PASS]  LiteLLM proxy reachable http://localhost:4000 responded 200
+[PASS]  LiteLLM master key     Present and well-formed
+[PASS]  Eval config parse      examples/code_review/eval_config.yaml
+[PASS]  test_cases_dir exists  /path/to/code_snippets
+... (etc)
+All probes passed cleanly. You're ready to run an eval pass.
+```
+
+If anything FAILs, fix it before continuing — see [Troubleshooting](#troubleshooting).
+
+### Phase 2 — Eval pass (per evaluation cycle)
+
+Run the Cartesian, write traces + LLM judge scores to Langfuse, enqueue
+sampled traces for humans.
+
+```bash
+caliper-eval examples/code_review/eval_config.yaml
+```
+
+What happens:
+
+1. **Dataset bootstrap.** Folder of test cases becomes a Langfuse Dataset
+   (idempotent on item id — re-runs upsert, never duplicate).
+2. **Cartesian loop.** For each `(prompt × model × snippet × iteration)`, the
+   framework opens a Langfuse trace linked to a Dataset Run named
+   `<campaign>__<prompt_id>__<model>__<timestamp>`.
+3. **LLM call.** Routed through the LiteLLM proxy. Token usage attached to
+   the generation observation; Langfuse computes cost server-side.
+4. **Judge call.** The generic `RubricJudge` templates the judge prompt
+   with the rubric metadata, calls the judge model, parses structured JSON
+   back into per-dimension scores.
+5. **Scores attached.** One Score per dimension, one boolean `__pass`
+   score per dimension, plus `overall` and `overall__pass`, all on the
+   parent trace.
+6. **Sample for humans.** If `human_review.enabled=true` in the config,
+   the sampler picks N traces per Run and enqueues them via the Langfuse
+   Annotation Queue REST API.
+
+After this completes, the Langfuse UI shows the Experiments comparison view
+populated with aggregated scores per `(prompt, model)` combo. That's the
+"which combo wins?" answer.
+
+### Phase 3 — Human review (per cycle, async)
+
+Humans annotate sampled traces in the Langfuse UI. **No Caliper command for
+this phase** — it's all UI work.
+
+1. Open Langfuse: **http://localhost:3000**
+2. Sidebar → **Annotation Queues** → click the queue named in `eval_config.yaml`
+3. Click **Annotate Next Item** to walk through queued traces
+4. For each trace, score every rubric dimension (slider for NUMERIC, toggle
+   for BOOLEAN `__pass`) and submit
+5. Repeat until the queue is empty (or you've done enough for calibration —
+   ~12-20 samples is plenty for a useful agreement estimate)
+
+Human scores attach to the trace with `source=ANNOTATION`. They sit alongside
+the LLM scores (`source=API`) on the same trace — calibration will pair them
+in phase 4.
+
+### Phase 4 — Calibration report (per cycle, after some humans annotate)
+
+Read paired LLM + human scores, compute agreement metrics, print + CSV-write
+a report.
+
+```bash
+caliper-calibrate examples/code_review/eval_config.yaml
+```
+
+Output:
+
+```
+========================================================================
+CALIPER CALIBRATION REPORT
+========================================================================
+
+Dimension                       N      MAE        r      rho    kappa
+------------------------------------------------------------------------
+actionability                  12    0.087    0.872    0.853     -
+actionability__pass            12      -        -        -    0.667
+finds_bug                      12    0.052    0.921    0.934     -
+finds_bug__pass                12      -        -        -    0.833
+overall                        12    0.071    0.889    0.901     -
+overall__pass                  12      -        -        -    0.750
+
+  Confusion for finds_bug__pass:  TP=8  FP=1  TN=2  FN=1
+
+Guidance: r/rho > 0.85 and kappa > 0.70 = trust the LLM judge.
+          Anything materially lower means the judge prompt or rubric
+          needs revisiting before treating LLM scores as authoritative.
+
+[caliper] CSV written to results/calibration-code-review-eval-20260608-141522.csv
+```
+
+If agreement is good (r/ρ > 0.85, κ > 0.70), you can trust the LLM judge for
+larger matrices without humans in the loop. If it's bad, edit the judge
+prompt template (or rubric thresholds), re-run phases 2-4. That's the loop.
+
+Full calibration setup guide (with manual UI fallback for queue creation
+when the REST auto-create can't run): [docs/human-review-setup.md](docs/human-review-setup.md).
+
+---
+
+## Configuration reference
+
+All eval configs are YAML matching the `EvalConfig` Pydantic model in
+[caliper/schemas.py](caliper/schemas.py). Minimal example:
+
+```yaml
+name: "code-review-eval"
+dataset_name: "code-eval-snippets-v1"
+test_cases_dir: "code_snippets"
+prompts_dir: "prompts"
+judge_prompts_dir: "judge_prompts"
+judge_prompt: "rubric_judge_v1"      # folder name under judge_prompts/
+judge_model: "gpt-4o-mini"           # alias from litellm_config.yaml
+models:                              # aliases from litellm_config.yaml
+  - "gpt-4o-mini"
+  - "claude-haiku"
+iterations: 3                        # per (prompt, model, test_case) cell
+
+human_review:
+  enabled: true
+  queue_name: "code-review-calibration"
+  sample_strategy: stratified        # or "random" | "all"
+  samples_per_run: 2
+  auto_create: true                  # try REST-API to create queue + configs
+```
+
+`extra_run_metadata` (optional) lets you stamp every Dataset Run with
+arbitrary key/values for richer filtering in the Experiments view.
+
+---
 
 ## Philosophy
 
 - **Test cases own the rubric.** The judge is a generic executor; what
-  it's judging *against* lives on the test case's metadata. One framework,
-  N eval types (code review, agent tool-call verification, agent outcome
-  correctness, …) — selected by a single `eval_type` discriminator.
-- **Configs in folders, framework in code.** Adding a new eval type or a
-  new test case means dropping files into a folder — not editing the
-  framework. The framework is the runner; the configs are the work.
-- **OSS dependencies all the way down.** [Langfuse](https://langfuse.com)
-  for trace + score storage. [LiteLLM](https://github.com/BerriAI/litellm)
-  for multi-vendor LLM calls. Everything runs in your own Docker.
+  it's judging *against* lives on the test case's `metadata.json`. One
+  framework, N eval types (code review, agent tool-call verification, agent
+  outcome correctness, …) — selected by a single `eval_type` discriminator.
+- **Configs in folders, framework in code.** Adding a new eval type or
+  test case means dropping files into a folder — not editing the framework.
+- **OSS dependencies all the way down.** Langfuse for trace + score storage.
+  LiteLLM proxy for multi-vendor LLM calls. Everything runs in your own
+  Docker.
 
-## Quickstart
+---
 
-### 1. Bring up the local stack
+## Troubleshooting
 
-```bash
-cp .env.example .env
-./scripts/generate-secrets.sh   # prints values to paste into .env
-# Fill in upstream LLM provider keys (OPENAI_API_KEY, ANTHROPIC_API_KEY, ...)
-docker compose up -d
-docker compose ps               # all services should report "healthy"
-```
+### `caliper-check` says **Langfuse reachable: FAIL**
 
-The stack includes:
-
-| Service       | URL / Port                    | Purpose                                  |
-| ------------- | ----------------------------- | ---------------------------------------- |
-| Langfuse UI   | http://localhost:3000         | Traces, datasets, scores, experiments    |
-| LiteLLM Proxy | http://localhost:4000         | Unified gateway to OpenAI / Anthropic /… |
-| Postgres      | localhost:5432                | Langfuse operational data                |
-| ClickHouse    | localhost:8123                | Langfuse trace storage                   |
-| MinIO console | http://localhost:9091         | S3-compatible blob store                 |
-| Redis         | localhost:6379                | Langfuse ingestion queue                 |
-
-### 2. First-time Langfuse setup
-
-Open http://localhost:3000, sign up (local-only account), create a project,
-copy the public + secret API keys into `.env` as `LANGFUSE_PUBLIC_KEY` and
-`LANGFUSE_SECRET_KEY`.
-
-### 3. Install Caliper
+The Langfuse stack isn't responding on the URL in `LANGFUSE_HOST`. Verify:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate    # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"
+docker compose ps                    # langfuse-web should be "healthy"
+docker compose logs langfuse-web     # check for startup errors
+curl http://localhost:3000/api/public/health
 ```
 
-### 4. Run an evaluation
+Common causes: stack not started, port 3000 in use, browser-side caching of
+the URL (use `curl` to confirm independently).
+
+### `caliper-check` says **Langfuse credentials: FAIL**
+
+`LANGFUSE_PUBLIC_KEY` and `LANGFUSE_SECRET_KEY` are missing or wrong. Go to
+the Langfuse UI → your project → Settings → API Keys → create a new key,
+copy both values into `.env`, source `.env` (or restart your shell).
+
+### `caliper-check` says **LiteLLM proxy reachable: FAIL**
+
+The LiteLLM container isn't responding. Verify:
 
 ```bash
-python -m caliper.eval_runner examples/code_review/eval_config.yaml
+docker compose ps                    # litellm should be "healthy"
+docker compose logs litellm
+curl http://localhost:4000/health/liveliness
 ```
 
-(Sample eval lands in Milestone 4 — for now, point at any eval_config.yaml
-following the [schema](caliper/schemas.py).)
+Common causes: missing `LITELLM_MASTER_KEY` in `.env`, malformed
+`litellm_config.yaml`, all upstream provider API keys empty (proxy starts
+but can't route).
 
-## How it works
+### `caliper-eval` runs but says `WARN: failed to enqueue trace ... for human review`
 
-For each `(prompt, model, test_case, iteration)` Caliper:
+The Langfuse Annotation Queue REST API returned an error. The eval pass
+will still complete — LLM scores are all written. Only the human-review
+sampling is skipped.
 
-1. Opens a Langfuse trace bound to a **Dataset Run** named after the
-   `(prompt, model)` pair, so the Experiments view aggregates per combo.
-2. Calls the model under test via the LiteLLM proxy, capturing the LLM call
-   as a child **Generation** observation with token usage attached.
-3. Sends the output to the **rubric judge** — a generic LLM-as-judge that
-   reads the rubric from `metadata.json` and emits per-dimension scores
-   plus reasoning.
-4. Attaches one Langfuse **Score** per rubric dimension, one boolean
-   `__pass` score per dimension, and an aggregate `overall` + `overall__pass`
-   on the parent trace.
+Most common cause: the queue or score-config endpoints differ between
+Langfuse versions. Look at the WARN output — it includes the full URL
+and HTTP status from the failed request. If the URL is wrong for your
+Langfuse version, edit `caliper/human_review.py` and adjust the
+`/api/public/...` paths to match. Or: set `human_review.auto_create: false`
+in your config, create the queue manually in the Langfuse UI under
+Annotation Queues, and Caliper will look it up by name.
 
-Result: the Langfuse Datasets -> Runs comparison view shows mean score and
-pass rate per `(prompt, model)` combo, with drilldowns into individual traces.
-That's the "which combo wins?" answer, materialized.
+See [docs/human-review-setup.md](docs/human-review-setup.md) for the
+manual UI path.
 
-## Human review and judge calibration
+### `caliper-calibrate` reports `no traces found tagged campaign:...`
 
-Caliper supports human-in-the-loop calibration of the LLM judge — sample
-some traces per Run, route them into a Langfuse Annotation Queue, then run
-the calibration report to see how well the LLM judge agrees with humans.
+Either no eval pass has run yet for this campaign name, or the campaign
+name in your config doesn't match the campaign tag on the traces. Verify
+in Langfuse UI: Traces → filter by tag → look for `campaign:<your-name>`.
 
-```bash
-# 0. Sanity-check the stack is ready
-python -m caliper.check_stack examples/code_review/eval_config.yaml
+### Judge returns non-JSON, calibration shows zero pairs
 
-# 1. Run an eval pass with human_review.enabled=true in the config
-python -m caliper.eval_runner examples/code_review/eval_config.yaml
+The judge model isn't producing parseable JSON. Two likely fixes:
 
-# 2. Humans annotate sampled traces in Langfuse UI (~15 min for a small pass)
+1. **Switch to a more-instruction-following judge model.** Cheaper judge
+   models sometimes wander. Try `gpt-4o-mini` or `claude-sonnet` instead.
+2. **Tighten the judge prompt.** The default template asks for JSON;
+   include an explicit `"You MUST return ONLY a JSON object matching this
+   schema: {...}"` line.
 
-# 3. Compute and print agreement metrics; writes CSV to ./results/
-python -m caliper.calibration examples/code_review/eval_config.yaml
-```
+### Eval pass burns a lot of API budget unexpectedly
 
-Full setup guide (including manual UI fallback if the auto-create REST calls
-hit Langfuse-version restrictions): [docs/human-review-setup.md](docs/human-review-setup.md).
+Sanity-check your Cartesian: `prompts × models × test_cases × iterations`
+calls to the model under test + the same count of calls to the judge
+(judge is called once per trace). For 2 × 3 × 5 × 3 = 90 traces, that's
+180 LLM calls per pass. Use cheap models for the judge (`gpt-4o-mini`,
+`claude-haiku`) — see the [insight on the judge cost knob](docs/human-review-setup.md).
+
+---
 
 ## License
 

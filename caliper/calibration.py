@@ -1,41 +1,23 @@
 """Judge calibration — compute human-vs-LLM agreement metrics.
 
-Run AFTER humans have worked through the annotation queue. Reads every score
-attached to traces in the eval campaign, pairs LLM-source scores against
-ANNOTATION-source scores by trace_id + score name, and reports:
+Library entry points. Read scores by REST, pair LLM-source with
+ANNOTATION-source, compute MAE / Pearson r / Spearman rho / Cohen's kappa /
+confusion matrices, print + CSV-write a report.
 
-    Mean Absolute Error    — avg distance between LLM and human (NUMERIC)
-    Pearson r              — linear correlation
-    Spearman rho           — rank correlation (robust to scale drift)
-    Cohen's kappa          — chance-adjusted agreement on BOOLEAN pass scores
-    Confusion matrix       — where the LLM is systematically wrong
-
-Run:
-
-    python -m caliper.calibration path/to/eval_config.yaml
-
-Writes ./results/calibration-<timestamp>.csv with per-trace pair detail for
-external charting / sharing.
+The CLI shim that wires these together against a YAML config lives in
+`caliper.cli.calibrate`.
 """
 
 from __future__ import annotations
 
 import csv
-import os
-import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
 from math import sqrt
 from pathlib import Path
 from typing import Any
 
-import httpx
-import yaml
-from dotenv import load_dotenv
-
 from caliper.human_review import LangfuseAnnotationClient
-from caliper.schemas import EvalConfig
 
 
 # ---------------------------------------------------------------------------
@@ -320,44 +302,3 @@ def write_csv(reports: list[DimensionReport], pairs_by_name: dict[str, list[Scor
                     )
 
 
-# ---------------------------------------------------------------------------
-# CLI
-# ---------------------------------------------------------------------------
-
-
-def main() -> None:
-    if len(sys.argv) != 2:
-        print("Usage: python -m caliper.calibration <path/to/eval_config.yaml>", file=sys.stderr)
-        sys.exit(2)
-    load_dotenv()
-    cfg_path = Path(sys.argv[1])
-    with cfg_path.open(encoding="utf-8") as f:
-        config = EvalConfig.model_validate(yaml.safe_load(f))
-
-    client = LangfuseAnnotationClient.from_env()
-    try:
-        print(f"[caliper.calibration] fetching traces for campaign {config.name!r}")
-        traces = fetch_traces_for_campaign(client, config.name)
-        if not traces:
-            print(f"[caliper.calibration] no traces found tagged campaign:{config.name}")
-            sys.exit(0)
-        print(f"[caliper.calibration] found {len(traces)} trace(s)")
-
-        print("[caliper.calibration] fetching scores")
-        scores = fetch_all_scores_for_campaign(client, config.name)
-        print(f"[caliper.calibration] found {len(scores)} score(s) total")
-
-        by_name = build_score_pairs(scores, set(traces.keys()))
-        reports = report(by_name)
-        print_report(reports)
-
-        ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-        out = Path("results") / f"calibration-{config.name}-{ts}.csv"
-        write_csv(reports, by_name, out)
-        print(f"[caliper.calibration] CSV written to {out}")
-    finally:
-        client.close()
-
-
-if __name__ == "__main__":
-    main()

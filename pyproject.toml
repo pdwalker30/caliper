@@ -49,11 +49,20 @@ Homepage = "https://github.com/pdwalker30/caliper"
 Repository = "https://github.com/pdwalker30/caliper"
 Issues = "https://github.com/pdwalker30/caliper/issues"
 
+# Console scripts — installed when you `pip install -e .` or `pip install caliper`.
+# Lets you type `caliper-eval ...` instead of `python -m caliper.cli.eval ...`.
+[project.scripts]
+caliper-eval = "caliper.cli.eval:main"
+caliper-check = "caliper.cli.check:main"
+caliper-calibrate = "caliper.cli.calibrate:main"
+
 [build-system]
 requires = ["hatchling>=1.18"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
+# Single top-level package; sub-packages (caliper.cli, caliper.judges) are
+# auto-discovered via __init__.py.
 packages = ["caliper"]
 
 [tool.ruff]

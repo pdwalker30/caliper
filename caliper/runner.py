@@ -1,19 +1,20 @@
-"""Cartesian eval runner.
+"""Cartesian eval runner — library entry points.
 
-Reads a YAML EvalConfig, walks (prompt x model x test_case x iteration), and for
-each combination opens a Langfuse trace with three observations:
+This module is pure library code. It exposes `run_eval(config_path)` and
+the helpers it calls. The CLI shim lives in `caliper.cli.eval` so this
+module has zero side effects on import and can be embedded in notebooks,
+CI scripts, or larger orchestrators without dragging argv parsing along.
+
+For each (prompt, model, test_case, iteration) combination, `run_eval` opens
+a Langfuse trace with:
 
   1. parent root span     — bound to the Langfuse Dataset Run (run_name)
   2. child generation     — the LLM call (token usage attached, server-side cost)
   3. child generation     — the judge call
 
-Then it attaches one Score per rubric dimension plus boolean pass scores plus
-an overall, all stamped on the parent trace so the Experiments comparison view
-can aggregate them per (prompt, model) run.
-
-Usage:
-
-    python -m caliper.eval_runner path/to/eval_config.yaml
+Then it attaches one Score per rubric dimension plus boolean pass scores
+plus an overall, all stamped on the parent trace so the Experiments
+comparison view can aggregate them per (prompt, model) run.
 """
 
 from __future__ import annotations
@@ -27,7 +28,7 @@ import yaml
 from dotenv import load_dotenv
 from langfuse import Langfuse
 
-from caliper.dataset_bootstrap import bootstrap_dataset
+from caliper.dataset_bootstrap import bootstrap_dataset, load_test_cases
 from caliper.human_review import (
     LangfuseAnnotationClient,
     Sampler,
@@ -88,11 +89,17 @@ def load_judge_prompt(
 
 
 # ---------------------------------------------------------------------------
-# Eval pass
+# Eval pass — top-level orchestration
 # ---------------------------------------------------------------------------
 
 
 def run_eval(config_path: Path) -> None:
+    """Run one complete eval pass from a YAML EvalConfig.
+
+    Idempotent on the Langfuse Dataset (re-runs upsert items, don't duplicate).
+    Each invocation produces a fresh timestamp-tagged Dataset Run per
+    (prompt, model) combo so eval cycles don't collide.
+    """
     load_dotenv()
     config = load_eval_config(config_path)
 
@@ -104,7 +111,6 @@ def run_eval(config_path: Path) -> None:
     langfuse = Langfuse()
     client = LiteLLMProxyClient()
 
-    # 1. Bootstrap dataset
     print(f"[caliper] bootstrapping dataset {config.dataset_name!r} from {test_cases_dir}")
     n_items = bootstrap_dataset(
         langfuse=langfuse,
@@ -114,7 +120,6 @@ def run_eval(config_path: Path) -> None:
     )
     print(f"[caliper] dataset has {n_items} item(s)")
 
-    # 2. Load assets
     prompts = load_prompts(prompts_dir)
     judge_prompt_text, judge_prompt_meta = load_judge_prompt(
         judge_prompts_dir, config.judge_prompt
@@ -127,15 +132,12 @@ def run_eval(config_path: Path) -> None:
         judge_prompt_metadata=judge_prompt_meta,
     )
 
-    # 3. Fetch dataset (now that it's bootstrapped, items are linkable to runs)
     dataset = langfuse.get_dataset(name=config.dataset_name)
 
-    # 3.5. Set up human review infrastructure (best-effort — never fails the pass)
     annotation_client, queue_id, sampler = _maybe_setup_human_review(
         config=config, test_cases_dir=test_cases_dir
     )
 
-    # 4. Cartesian loop
     timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     total = len(prompts) * len(config.models) * len(dataset.items) * config.iterations
     print(
@@ -208,12 +210,6 @@ def _maybe_setup_human_review(
     except Exception as e:
         print(f"[caliper] WARN: human review setup skipped — {e}", file=sys.stderr)
         return None, None, None
-
-    # Derive score configs from the FIRST test case's rubric. POC assumption:
-    # all rubrics in this eval pass share dimension names. If they don't, the
-    # later items still score correctly via the SDK — only the queue UI surface
-    # may show extra/missing fields.
-    from caliper.dataset_bootstrap import load_test_cases
 
     try:
         cases = load_test_cases(test_cases_dir)
@@ -299,10 +295,6 @@ def _run_one(
         run_metadata=run_metadata,
         run_description=f"Caliper eval pass: {config.name}",
     ) as parent:
-        # Tags are how cross-cutting Trace-view filters work — they let you
-        # ask questions that span Runs (e.g. "show every trace that scored
-        # poorly on snippet X regardless of which combo produced it").
-        # Run-level questions stay in run_metadata; per-trace questions in tags.
         parent.update(
             input={
                 "prompt": prompt_text,
@@ -385,7 +377,6 @@ def _run_one(
         )
 
         # ----- 4. Optional: enqueue for human review -----
-        # Best-effort — failure to enqueue must NOT fail the eval pass.
         if (
             annotation_client is not None
             and queue_id is not None
@@ -408,17 +399,3 @@ def _run_one(
                         f"for human review: {e}",
                         file=sys.stderr,
                     )
-
-
-def main() -> None:
-    if len(sys.argv) != 2:
-        print(
-            "Usage: python -m caliper.eval_runner <path/to/eval_config.yaml>",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-    run_eval(Path(sys.argv[1]))
-
-
-if __name__ == "__main__":
-    main()
