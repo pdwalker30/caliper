@@ -72,6 +72,25 @@ extra_run_metadata:
   ruleset: "code-review-rubric-v1"
 
 # ----------------------------------------------------------------------------
+# Langfuse model-name mapping (optional)
+# ----------------------------------------------------------------------------
+# When LiteLLM returns a model name Langfuse's pricing map doesn't recognize
+# (e.g., Databricks-served models, custom fine-tunes), Langfuse can't compute
+# server-side cost. Map the LiteLLM-returned name -> a name Langfuse knows.
+#
+# How to find the LiteLLM-returned name: run a single eval cell, open the
+# trace's generation in Langfuse UI, look at the `model` field. That string
+# is what goes on the LEFT side of the mapping below.
+#
+# Empty for this sample — the cheap-model aliases here are already in
+# Langfuse's built-in pricing map.
+langfuse_model_mapping: {}
+# Example for Databricks-backed models:
+# langfuse_model_mapping:
+#   "databricks-llama-3-70b-instruct": "llama-3-70b-instruct"
+#   "databricks/claude-via-bedrock": "claude-sonnet-4-5"
+
+# ----------------------------------------------------------------------------
 # Retry / backoff for LLM calls
 # ----------------------------------------------------------------------------
 # Defaults are sane for typical hosted-LLM rate limits. Bump max_attempts /

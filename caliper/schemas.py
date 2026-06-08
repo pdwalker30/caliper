@@ -196,6 +196,20 @@ class EvalConfig(BaseModel):
     extra_run_metadata: dict[str, Any] = Field(default_factory=dict)
     human_review: HumanReviewConfig | None = None
     retry: RetryConfig = Field(default_factory=RetryConfig)
+    # Map LiteLLM-returned model names to names Langfuse's built-in pricing
+    # map recognizes. Needed when models are hosted behind providers Langfuse
+    # doesn't know about by default (e.g., Databricks-served Llama, internal
+    # fine-tuned endpoints) — without this, the generation's `model` field
+    # doesn't match Langfuse's pricing table and cost stays at 0.
+    #
+    # Format: {litellm_returned_name: langfuse_recognized_name, ...}
+    # Example:
+    #   databricks-llama-3-70b-instruct: llama-3-70b-instruct
+    #   databricks/claude-sonnet-via-bedrock: claude-sonnet-4-5
+    #
+    # Alternative: register the custom model in the Langfuse UI under
+    # Settings -> Models with the LiteLLM-returned name and your own prices.
+    langfuse_model_mapping: dict[str, str] = Field(default_factory=dict)
     # Opt-in idempotency: when True, Caliper computes a hash per Cartesian cell
     # (campaign + prompt text + judge prompt text + model + judge model + snippet
     # content + expected + rubric + iteration) and skips any cell whose hash

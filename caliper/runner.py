@@ -46,6 +46,21 @@ from caliper.schemas import (
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _langfuse_model(name: str, mapping: dict[str, str]) -> str:
+    """Apply the LiteLLM -> Langfuse model-name rewrite, or passthrough.
+
+    Used so Langfuse's built-in pricing map can compute server-side cost even
+    when LiteLLM returns model names Langfuse doesn't natively know about
+    (Databricks-served models, internal fine-tunes, etc.).
+    """
+    return mapping.get(name, name)
+
+
+# ---------------------------------------------------------------------------
 # Asset loading
 # ---------------------------------------------------------------------------
 
@@ -420,7 +435,7 @@ def _run_one(
         # ----- 1. The model under test -----
         with parent.start_as_current_generation(
             name=f"llm-call:{model}",
-            model=model,
+            model=_langfuse_model(model, config.langfuse_model_mapping),
             input=[{"role": "user", "content": rendered_prompt}],
         ) as gen:
             result = client.complete(
@@ -430,13 +445,15 @@ def _run_one(
             gen.update(
                 output=result.output,
                 usage_details=result.usage,
-                model=result.model,
+                # Map LiteLLM-returned name -> Langfuse pricing-map name.
+                # Passthrough if no mapping entry exists for this name.
+                model=_langfuse_model(result.model, config.langfuse_model_mapping),
             )
 
         # ----- 2. The judge -----
         with parent.start_as_current_generation(
             name="judge",
-            model=config.judge_model,
+            model=_langfuse_model(config.judge_model, config.langfuse_model_mapping),
             input=[{"role": "system", "content": "Caliper rubric judge"}],
         ) as judge_gen:
             verdict = judge.evaluate(

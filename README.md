@@ -246,6 +246,14 @@ retry:
 # Edit a prompt -> hash changes -> cell re-runs. No version field to bump.
 # Override for one run with: caliper-eval --force <config.yaml>
 idempotent: false
+
+# Optional. Map LiteLLM-returned model names to Langfuse-recognized names
+# so Langfuse's built-in pricing map can compute cost. Needed when models
+# are hosted behind providers Langfuse doesn't know natively (Databricks,
+# internal fine-tunes, custom Bedrock endpoints, etc.).
+langfuse_model_mapping:
+  "databricks-llama-3-70b-instruct": "llama-3-70b-instruct"
+  "internal-fine-tuned-judge": "gpt-4o"
 ```
 
 `extra_run_metadata` (optional) lets you stamp every Dataset Run with
@@ -381,6 +389,36 @@ cell #41 had a transient issue.
 To re-run only the failed cells later: set `idempotent: true`, leave the
 successful traces in place, re-run. Caliper will skip the successful cells
 (hashes match) and re-attempt only the missing ones.
+
+### Langfuse traces show cost as $0.00 (or no cost at all)
+
+Langfuse computes server-side cost by looking up the generation's `model`
+field against its built-in pricing table (plus any custom models you've
+added under Settings → Models). If the model name LiteLLM returned isn't
+in either table, cost stays at $0.
+
+Two fixes:
+
+**(A) Map the name in `eval_config.yaml`** — preferred for portability:
+
+```yaml
+langfuse_model_mapping:
+  "databricks-llama-3-70b-instruct": "llama-3-70b-instruct"
+  "internal-fine-tuned-judge": "gpt-4o"
+```
+
+The LEFT side is what LiteLLM returns (visible on the generation's `model`
+field in the Langfuse UI). The RIGHT side is a name Langfuse already knows.
+
+**(B) Register the model in Langfuse UI** — preferred when no equivalent
+public model exists for pricing:
+
+Settings → Models → Add custom model. Use the LiteLLM-returned name
+exactly. Set input + output prices per 1M tokens.
+
+Don't do both for the same model — pick one. Option A is portable across
+Langfuse instances (e.g., self-hosted at home vs. self-hosted at work);
+option B is more accurate when your custom model has unique pricing.
 
 ### Eval pass burns a lot of API budget unexpectedly
 
