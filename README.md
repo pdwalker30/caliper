@@ -53,12 +53,41 @@ Open http://localhost:3000, sign up (local-only account), create a project,
 copy the public + secret API keys into `.env` as `LANGFUSE_PUBLIC_KEY` and
 `LANGFUSE_SECRET_KEY`.
 
-### 3. Run an evaluation
+### 3. Install Caliper
 
 ```bash
-# (Coming in Milestone 4)
+python -m venv .venv
+source .venv/bin/activate    # Windows: .venv\Scripts\activate
+pip install -e ".[dev]"
+```
+
+### 4. Run an evaluation
+
+```bash
 python -m caliper.eval_runner examples/code_review/eval_config.yaml
 ```
+
+(Sample eval lands in Milestone 4 — for now, point at any eval_config.yaml
+following the [schema](caliper/schemas.py).)
+
+## How it works
+
+For each `(prompt, model, test_case, iteration)` Caliper:
+
+1. Opens a Langfuse trace bound to a **Dataset Run** named after the
+   `(prompt, model)` pair, so the Experiments view aggregates per combo.
+2. Calls the model under test via the LiteLLM proxy, capturing the LLM call
+   as a child **Generation** observation with token usage attached.
+3. Sends the output to the **rubric judge** — a generic LLM-as-judge that
+   reads the rubric from `metadata.json` and emits per-dimension scores
+   plus reasoning.
+4. Attaches one Langfuse **Score** per rubric dimension, one boolean
+   `__pass` score per dimension, and an aggregate `overall` + `overall__pass`
+   on the parent trace.
+
+Result: the Langfuse Datasets -> Runs comparison view shows mean score and
+pass rate per `(prompt, model)` combo, with drilldowns into individual traces.
+That's the "which combo wins?" answer, materialized.
 
 ## License
 

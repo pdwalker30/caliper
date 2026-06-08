@@ -1,0 +1,144 @@
+"""Pydantic data contracts shared across Caliper.
+
+These models define the on-disk format for test cases, prompts, judge prompts,
+and the per-pass eval configuration — plus the in-memory shape of judge verdicts
+and per-dimension scores. Every other module in Caliper consumes these types;
+this file is the schema source of truth.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field
+
+
+# ---------------------------------------------------------------------------
+# Rubric — the contract between a test case and the judge
+# ---------------------------------------------------------------------------
+
+
+class RubricDimension(BaseModel):
+    """One scored dimension within a rubric."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    description: str
+    weight: float = Field(ge=0, le=1)
+    pass_threshold: float = Field(ge=0, le=1)
+    scale: str = "0-1"
+
+
+class Rubric(BaseModel):
+    """A rubric — multiple dimensions plus aggregation policy.
+
+    Lives on `TestCaseMetadata.rubric`. The judge reads this and emits one
+    DimensionScore per dimension plus an aggregate overall score.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    dimensions: list[RubricDimension]
+    aggregation: Literal["weighted_mean", "min", "max"] = "weighted_mean"
+    overall_pass_threshold: float = Field(ge=0, le=1, default=0.7)
+
+
+# ---------------------------------------------------------------------------
+# On-disk metadata.json shapes (per asset folder)
+# ---------------------------------------------------------------------------
+
+
+class TestCaseMetadata(BaseModel):
+    """`metadata.json` next to a test-case content file.
+
+    `eval_type` is the discriminator that routes to the right judge adapter
+    later (code_review, agent_tool_call, agent_outcome, ...). `expected`
+    holds eval-type-specific reference data (seeded bugs, required tools,
+    expected outcomes, etc.). Extra fields are allowed for forward-compat.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    eval_type: str
+    rubric: Rubric
+    expected: dict[str, Any] = Field(default_factory=dict)
+    description: str = ""
+    tags: list[str] = Field(default_factory=list)
+
+
+class PromptMetadata(BaseModel):
+    """`metadata.json` next to a prompt.txt."""
+
+    model_config = ConfigDict(extra="allow")
+
+    name: str
+    version: str = "1"
+    description: str = ""
+    tags: list[str] = Field(default_factory=list)
+
+
+class JudgePromptMetadata(BaseModel):
+    """`metadata.json` next to a judge_prompt.txt."""
+
+    model_config = ConfigDict(extra="allow")
+
+    name: str
+    version: str = "1"
+    description: str = ""
+    # Optional pin — if set, eval_config can default to this judge model
+    default_judge_model: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Judge verdict — the in-memory result of one judging pass
+# ---------------------------------------------------------------------------
+
+
+class DimensionScore(BaseModel):
+    """The judge's verdict for one rubric dimension on one trace."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    value: float = Field(ge=0, le=1)
+    passed: bool
+    reasoning: str = ""
+
+
+class JudgeVerdict(BaseModel):
+    """Aggregated judge output for one (prompt × model × test_case × iter)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    dimensions: dict[str, DimensionScore]
+    overall_value: float = Field(ge=0, le=1)
+    overall_passed: bool
+    raw_response: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Eval configuration — the YAML driver for one eval pass
+# ---------------------------------------------------------------------------
+
+
+class EvalConfig(BaseModel):
+    """The top-level YAML file Caliper reads to drive one eval pass.
+
+    Folder paths (`test_cases_dir`, `prompts_dir`, `judge_prompts_dir`) are
+    resolved relative to the config file's directory, so configs are portable
+    when whole examples/ folders move.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    dataset_name: str
+    test_cases_dir: str
+    prompts_dir: str
+    judge_prompts_dir: str
+    judge_prompt: str
+    judge_model: str
+    models: list[str] = Field(min_length=1)
+    iterations: int = Field(ge=1, default=1)
+    extra_run_metadata: dict[str, Any] = Field(default_factory=dict)

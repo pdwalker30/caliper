@@ -19,12 +19,27 @@ classifiers = [
     "Topic :: Software Development :: Quality Assurance",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
-# Runtime dependencies are intentionally left for Milestone 3 to keep this
-# initial commit minimal — the package skeleton is the work product here.
-dependencies = []
+dependencies = [
+    # Langfuse v3 Python SDK — datasets, traces, generations, scores, runs
+    "langfuse>=3.0,<4.0",
+    # OpenAI-compatible client used to talk to the LiteLLM proxy container
+    "openai>=1.50,<2.0",
+    # Data contracts (test cases, rubric, verdicts, eval config)
+    "pydantic>=2.0,<3.0",
+    # YAML eval configs
+    "pyyaml>=6.0",
+    # .env loading for credentials
+    "python-dotenv>=1.0",
+]
 
 [project.optional-dependencies]
-dev = []
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.12",
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "types-PyYAML>=6.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/pdwalker30/caliper"
