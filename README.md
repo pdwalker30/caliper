@@ -89,6 +89,28 @@ Result: the Langfuse Datasets -> Runs comparison view shows mean score and
 pass rate per `(prompt, model)` combo, with drilldowns into individual traces.
 That's the "which combo wins?" answer, materialized.
 
+## Human review and judge calibration
+
+Caliper supports human-in-the-loop calibration of the LLM judge — sample
+some traces per Run, route them into a Langfuse Annotation Queue, then run
+the calibration report to see how well the LLM judge agrees with humans.
+
+```bash
+# 0. Sanity-check the stack is ready
+python -m caliper.check_stack examples/code_review/eval_config.yaml
+
+# 1. Run an eval pass with human_review.enabled=true in the config
+python -m caliper.eval_runner examples/code_review/eval_config.yaml
+
+# 2. Humans annotate sampled traces in Langfuse UI (~15 min for a small pass)
+
+# 3. Compute and print agreement metrics; writes CSV to ./results/
+python -m caliper.calibration examples/code_review/eval_config.yaml
+```
+
+Full setup guide (including manual UI fallback if the auto-create REST calls
+hit Langfuse-version restrictions): [docs/human-review-setup.md](docs/human-review-setup.md).
+
 ## License
 
 [MIT](LICENSE) — use it however you like.

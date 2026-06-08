@@ -28,6 +28,11 @@ from dotenv import load_dotenv
 from langfuse import Langfuse
 
 from caliper.dataset_bootstrap import bootstrap_dataset
+from caliper.human_review import (
+    LangfuseAnnotationClient,
+    Sampler,
+    score_configs_for_rubric,
+)
 from caliper.judges.rubric_judge import RubricJudge
 from caliper.litellm_client import LiteLLMProxyClient
 from caliper.schemas import (
@@ -125,6 +130,11 @@ def run_eval(config_path: Path) -> None:
     # 3. Fetch dataset (now that it's bootstrapped, items are linkable to runs)
     dataset = langfuse.get_dataset(name=config.dataset_name)
 
+    # 3.5. Set up human review infrastructure (best-effort — never fails the pass)
+    annotation_client, queue_id, sampler = _maybe_setup_human_review(
+        config=config, test_cases_dir=test_cases_dir
+    )
+
     # 4. Cartesian loop
     timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
     total = len(prompts) * len(config.models) * len(dataset.items) * config.iterations
@@ -169,10 +179,93 @@ def run_eval(config_path: Path) -> None:
                     client=client,
                     judge=judge,
                     config=config,
+                    annotation_client=annotation_client,
+                    queue_id=queue_id,
+                    sampler=sampler,
                 )
 
     langfuse.flush()
+    if annotation_client is not None:
+        annotation_client.close()
     print(f"[caliper] done. {counter} trace(s) written to Langfuse.")
+
+
+def _maybe_setup_human_review(
+    *,
+    config: EvalConfig,
+    test_cases_dir: Path,
+) -> tuple[LangfuseAnnotationClient | None, str | None, Sampler | None]:
+    """Set up human-review queue + score configs if configured.
+
+    Never fails the eval pass. On any error, prints a WARN to stderr and
+    returns (None, None, None) — the runner will proceed without enqueueing.
+    """
+    if not config.human_review or not config.human_review.enabled:
+        return None, None, None
+
+    try:
+        client = LangfuseAnnotationClient.from_env()
+    except Exception as e:
+        print(f"[caliper] WARN: human review setup skipped — {e}", file=sys.stderr)
+        return None, None, None
+
+    # Derive score configs from the FIRST test case's rubric. POC assumption:
+    # all rubrics in this eval pass share dimension names. If they don't, the
+    # later items still score correctly via the SDK — only the queue UI surface
+    # may show extra/missing fields.
+    from caliper.dataset_bootstrap import load_test_cases
+
+    try:
+        cases = load_test_cases(test_cases_dir)
+        rubric = cases[0][2].rubric
+    except Exception as e:
+        print(
+            f"[caliper] WARN: could not derive rubric for queue setup ({e}); "
+            f"enqueueing disabled for this pass",
+            file=sys.stderr,
+        )
+        client.close()
+        return None, None, None
+
+    queue_id: str | None = None
+    if config.human_review.auto_create:
+        try:
+            specs = score_configs_for_rubric(rubric)
+            config_ids = [client.ensure_score_config(s) for s in specs]
+            queue_id = client.ensure_queue(
+                name=config.human_review.queue_name,
+                score_config_ids=config_ids,
+                description=f"Caliper human review: {config.name}",
+            )
+            print(
+                f"[caliper] human review queue ready: "
+                f"{config.human_review.queue_name!r} (id={queue_id})"
+            )
+        except Exception as e:
+            print(
+                f"[caliper] WARN: auto-create of score configs / queue failed: {e}\n"
+                f"[caliper]       Eval pass will continue WITHOUT enqueueing for human review.\n"
+                f"[caliper]       Create the queue manually in Langfuse UI and re-run, or\n"
+                f"[caliper]       set human_review.auto_create=false to suppress this attempt.",
+                file=sys.stderr,
+            )
+            queue_id = None
+    else:
+        queue = client.find_queue(config.human_review.queue_name)
+        if queue:
+            queue_id = queue["id"]
+            print(
+                f"[caliper] using pre-existing queue {config.human_review.queue_name!r}"
+            )
+        else:
+            print(
+                f"[caliper] WARN: queue {config.human_review.queue_name!r} not found "
+                f"(auto_create=false). Enqueueing disabled for this pass.",
+                file=sys.stderr,
+            )
+
+    sampler = Sampler(config.human_review) if queue_id else None
+    return client, queue_id, sampler
 
 
 def _run_one(
@@ -188,6 +281,9 @@ def _run_one(
     client: LiteLLMProxyClient,
     judge: RubricJudge,
     config: EvalConfig,
+    annotation_client: LangfuseAnnotationClient | None = None,
+    queue_id: str | None = None,
+    sampler: Sampler | None = None,
 ) -> None:
     """Single (prompt, model, item, iteration) trace.
 
@@ -287,6 +383,31 @@ def _run_one(
             value=1 if verdict.overall_passed else 0,
             data_type="BOOLEAN",
         )
+
+        # ----- 4. Optional: enqueue for human review -----
+        # Best-effort — failure to enqueue must NOT fail the eval pass.
+        if (
+            annotation_client is not None
+            and queue_id is not None
+            and sampler is not None
+        ):
+            if sampler.should_sample(
+                run_name=run_name,
+                item_id=item.id,
+                iteration=iteration,
+                overall_score=verdict.overall_value,
+            ):
+                try:
+                    annotation_client.add_trace_to_queue(
+                        queue_id=queue_id,
+                        trace_id=parent.trace_id,
+                    )
+                except Exception as e:
+                    print(
+                        f"[caliper] WARN: failed to enqueue trace {parent.trace_id} "
+                        f"for human review: {e}",
+                        file=sys.stderr,
+                    )
 
 
 def main() -> None:

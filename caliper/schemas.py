@@ -122,6 +122,35 @@ class JudgeVerdict(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+class HumanReviewConfig(BaseModel):
+    """Optional human-in-the-loop calibration of the LLM judge.
+
+    When enabled, the eval runner samples N traces per Dataset Run and
+    enqueues them into a Langfuse Annotation Queue for manual scoring.
+    Caliper's calibration module then reads paired (LLM, human) scores and
+    reports agreement metrics so you know how much to trust the LLM judge.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    queue_name: str = "caliper-human-review"
+
+    # How traces are selected for human review:
+    #   stratified: N samples per (prompt, model) Run (deterministic order)
+    #   random:     coin flip per trace with `sample_rate` probability
+    #   all:        every trace goes to the queue (don't do this with humans)
+    sample_strategy: Literal["stratified", "random", "all"] = "stratified"
+    samples_per_run: int = Field(ge=1, default=2)
+    sample_rate: float = Field(ge=0, le=1, default=0.15)
+
+    # When True, Caliper will attempt to create the queue and any missing
+    # ScoreConfigs via the Langfuse REST API. When False (or if the API call
+    # fails), the queue + configs must already exist in Langfuse — the eval
+    # pass will WARN but not fail.
+    auto_create: bool = True
+
+
 class EvalConfig(BaseModel):
     """The top-level YAML file Caliper reads to drive one eval pass.
 
@@ -142,3 +171,4 @@ class EvalConfig(BaseModel):
     models: list[str] = Field(min_length=1)
     iterations: int = Field(ge=1, default=1)
     extra_run_metadata: dict[str, Any] = Field(default_factory=dict)
+    human_review: HumanReviewConfig | None = None
