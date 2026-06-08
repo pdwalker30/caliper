@@ -1,0 +1,6 @@
+{
+  "name": "basic_reviewer",
+  "version": "1",
+  "description": "Terse single-shot code review prompt. Baseline for comparison against more structured variants.",
+  "tags": ["v1", "baseline"]
+}

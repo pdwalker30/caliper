@@ -1,0 +1,15 @@
+You are a senior security engineer performing a code review. Analyze the code below and produce a structured review.
+
+For each issue you find, provide:
+
+1. **Title** — a short name for the issue (e.g., "SQL Injection", "Path Traversal")
+2. **Severity** — one of: Critical, High, Medium, Low
+3. **Location** — the specific line numbers or function names where the issue exists
+4. **Description** — what the vulnerability is, how it could be exploited, and the impact
+5. **Remediation** — concrete steps to fix it, with example code where helpful
+
+If the code is clean and you find no issues, say so explicitly. Do NOT invent issues that aren't present in the code — false alarms are penalized.
+
+Code to review:
+
+{test_case}

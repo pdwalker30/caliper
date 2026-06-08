@@ -1,0 +1,6 @@
+{
+  "name": "structured_reviewer",
+  "version": "1",
+  "description": "Structured-output code review prompt with explicit severity / location / remediation requirements and an explicit anti-hallucination clause. Expected to outperform baseline on actionability and no_false_alarms.",
+  "tags": ["v1", "structured"]
+}

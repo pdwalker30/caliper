@@ -1,0 +1,109 @@
+# ============================================================================
+# Caliper sample eval — code review
+# ============================================================================
+# This is the public-safe demo eval. Five classic vulnerability snippets, two
+# prompts (a terse baseline + a structured variant), one judge prompt, four
+# rubric dimensions (finds_bug, severity_accuracy, actionability,
+# no_false_alarms).
+#
+# Run:
+#   caliper-check examples/code_review/eval_config.yaml
+#   caliper-eval  examples/code_review/eval_config.yaml
+#
+# Fork this folder layout for your own evals — change the snippets, prompts,
+# rubric dimensions, and models. The framework is fully driven by these files.
+
+# ----------------------------------------------------------------------------
+# Campaign identity
+# ----------------------------------------------------------------------------
+# `name` is stamped on every trace as the campaign tag and is used by
+# caliper-calibrate to find this eval's traces. Pick something distinctive.
+name: "code-review-sample"
+
+# Langfuse Dataset that snippets are loaded into. Idempotent on name +
+# item ids — re-runs upsert, never duplicate.
+dataset_name: "caliper-sample-code-snippets-v1"
+
+# ----------------------------------------------------------------------------
+# Asset paths (relative to THIS file's parent directory)
+# ----------------------------------------------------------------------------
+test_cases_dir: "code_snippets"
+prompts_dir: "prompts"
+judge_prompts_dir: "judge_prompts"
+
+# ----------------------------------------------------------------------------
+# Judge configuration
+# ----------------------------------------------------------------------------
+# Which judge prompt folder to use (must exist under judge_prompts_dir).
+judge_prompt: "rubric_judge_v1"
+
+# Model alias (from litellm_config.yaml) the judge runs against.
+# Cheap, instruction-following judges are usually the right default —
+# the judge does N calls per matrix where N == total cells, so cost adds up.
+judge_model: "gpt-4o-mini"
+
+# ----------------------------------------------------------------------------
+# Models under test
+# ----------------------------------------------------------------------------
+# Each entry is an alias from litellm_config.yaml. The Cartesian runs every
+# (prompt × model × snippet × iteration). Two models here ⇒ two columns in
+# the Experiments comparison view per prompt.
+models:
+  - "gpt-4o-mini"
+  - "claude-haiku"
+
+# ----------------------------------------------------------------------------
+# Cell count knob
+# ----------------------------------------------------------------------------
+# Per (prompt, model, snippet) cell, run N iterations. More iterations =
+# smaller variance per cell at higher LLM cost. Two is enough to show the
+# framework; bump to 5+ when you have a judge prompt you trust.
+iterations: 2
+
+# Total cells for this sample: 2 prompts × 2 models × 5 snippets × 2 iters = 40
+# Each cell = 1 LLM call + 1 judge call = 2 LLM calls
+# Total LLM calls per pass: ~80. At gpt-4o-mini pricing, well under $1.
+
+# ----------------------------------------------------------------------------
+# Optional: extra metadata stamped on every Dataset Run
+# ----------------------------------------------------------------------------
+extra_run_metadata:
+  purpose: "Caliper public sample eval"
+  ruleset: "code-review-rubric-v1"
+
+# ----------------------------------------------------------------------------
+# Retry / backoff for LLM calls
+# ----------------------------------------------------------------------------
+# Defaults are sane for typical hosted-LLM rate limits. Bump max_attempts /
+# max_wait_seconds if you're sustained-throttled.
+retry:
+  max_attempts: 5
+  initial_wait_seconds: 2.0
+  max_wait_seconds: 60.0
+  exponential_base: 2.0
+  jitter_seconds: 1.0
+  retry_on_statuses: [408, 425, 429, 500, 502, 503, 504]
+
+# ----------------------------------------------------------------------------
+# Idempotency
+# ----------------------------------------------------------------------------
+# Opt-in. When true, Caliper hashes every Cartesian cell over (campaign,
+# prompt text, judge text, model, judge model, snippet content, expected,
+# rubric, iteration). Cells whose hash exists on a prior trace are skipped.
+#
+# Edit a prompt -> hash changes -> cell re-runs. No version field to bump.
+# Override for one run: caliper-eval --force examples/code_review/eval_config.yaml
+idempotent: true
+
+# ----------------------------------------------------------------------------
+# Human review (calibration)
+# ----------------------------------------------------------------------------
+# OFF in this sample so first-time users get a clean green pass without
+# the annotation-queue REST API in the picture. Flip enabled to true when
+# you want the human-in-the-loop calibration loop active.
+human_review:
+  enabled: false
+  queue_name: "code-review-sample-calibration"
+  sample_strategy: "stratified"
+  samples_per_run: 2
+  auto_create: true

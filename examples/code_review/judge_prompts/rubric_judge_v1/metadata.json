@@ -1,0 +1,6 @@
+{
+  "name": "rubric_judge_v1",
+  "version": "1",
+  "description": "Generic rubric-driven judge for code-review evaluations. Templates over rubric dimensions from each test case's metadata.json. Returns structured JSON: one score and reasoning per dimension.",
+  "default_judge_model": "gpt-4o-mini"
+}
