@@ -62,6 +62,51 @@ def _langfuse_model(name: str, mapping: dict[str, str]) -> str:
     return mapping.get(name, name)
 
 
+def _filter_prompts(
+    prompts: list[tuple[str, str, PromptMetadata]],
+    allow_ids: list[str],
+) -> list[tuple[str, str, PromptMetadata]]:
+    """Subset prompts by id allowlist. Empty allowlist = no filter."""
+    if not allow_ids:
+        return prompts
+    selected = set(allow_ids)
+    available = {p[0] for p in prompts}
+    missing = selected - available
+    if missing:
+        print(
+            f"[caliper] WARN: prompt_ids not found in prompts dir: "
+            f"{sorted(missing)} (available: {sorted(available)})",
+            file=sys.stderr,
+        )
+    filtered = [p for p in prompts if p[0] in selected]
+    print(
+        f"[caliper] prompt_ids filter: {len(filtered)} of {len(prompts)} "
+        f"prompt(s) selected"
+    )
+    return filtered
+
+
+def _filter_dataset_items(items: list, allow_ids: list[str]) -> list:
+    """Subset Langfuse dataset items by id allowlist. Empty = no filter."""
+    if not allow_ids:
+        return items
+    selected = set(allow_ids)
+    available = {i.id for i in items}
+    missing = selected - available
+    if missing:
+        print(
+            f"[caliper] WARN: test_case_ids not found in dataset: "
+            f"{sorted(missing)} (available: {sorted(available)})",
+            file=sys.stderr,
+        )
+    filtered = [i for i in items if i.id in selected]
+    print(
+        f"[caliper] test_case_ids filter: {len(filtered)} of {len(items)} "
+        f"test case(s) selected"
+    )
+    return filtered
+
+
 # ---------------------------------------------------------------------------
 # Asset loading
 # ---------------------------------------------------------------------------
@@ -168,6 +213,12 @@ def run_eval(
 
     dataset = langfuse.get_dataset(name=config.dataset_name)
 
+    # Apply subsetting filters BEFORE building the Cartesian. The dataset
+    # itself still contains every test case (idempotent bootstrap), so toggling
+    # subsets doesn't churn the persistent Langfuse state.
+    prompts = _filter_prompts(prompts, config.prompt_ids)
+    dataset_items = _filter_dataset_items(list(dataset.items), config.test_case_ids)
+
     annotation_client, queue_id = _maybe_setup_human_review(
         config=config, test_cases_dir=test_cases_dir
     )
@@ -177,11 +228,11 @@ def run_eval(
     existing_hashes = _maybe_fetch_existing_hashes(config=config, force=force)
 
     timestamp = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-    total = len(prompts) * len(config.models) * len(dataset.items) * config.iterations
+    total = len(prompts) * len(config.models) * len(dataset_items) * config.iterations
     print(
         f"[caliper] expanding Cartesian: {total} cell(s) "
         f"({len(prompts)} prompt(s) x {len(config.models)} model(s) x "
-        f"{len(dataset.items)} item(s) x {config.iterations} iter(s))"
+        f"{len(dataset_items)} item(s) x {config.iterations} iter(s))"
     )
 
     # Build the work list upfront.
@@ -189,7 +240,7 @@ def run_eval(
     submissions, skipped = _build_submissions(
         config=config,
         prompts=prompts,
-        dataset=dataset,
+        dataset_items=dataset_items,
         judge_prompt_text=judge_prompt_text,
         timestamp=timestamp,
         existing_hashes=existing_hashes,
@@ -266,7 +317,7 @@ def _build_submissions(
     *,
     config: EvalConfig,
     prompts: list[tuple[str, str, PromptMetadata]],
-    dataset,
+    dataset_items: list,
     judge_prompt_text: str,
     timestamp: str,
     existing_hashes: set[str],
@@ -293,7 +344,7 @@ def _build_submissions(
             **config.extra_run_metadata,
         }
 
-        for item in dataset.items:
+        for item in dataset_items:
             test_case_meta = TestCaseMetadata.model_validate(item.metadata)
 
             for iteration in range(config.iterations):

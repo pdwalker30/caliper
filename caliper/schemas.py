@@ -233,6 +233,18 @@ class EvalConfig(BaseModel):
     judge_modes: list[Literal["anchored", "blind"]] = Field(
         default_factory=lambda: ["anchored"]
     )
+    # Optional subsetting. When non-empty, only folder ids in the list
+    # participate in the Cartesian. Empty / omitted = use ALL folders in
+    # the respective dir (current behavior).
+    #
+    # The Langfuse Dataset still gets bootstrapped with ALL test cases — the
+    # subset only affects which cells get executed this pass. So toggling
+    # subsets doesn't shrink or churn the persistent dataset.
+    #
+    # Missing ids (in the list but not present on disk) produce a WARN but
+    # don't fail the pass.
+    prompt_ids: list[str] = Field(default_factory=list)
+    test_case_ids: list[str] = Field(default_factory=list)
     # Map LiteLLM-returned model names to names Langfuse's built-in pricing
     # map recognizes. Needed when models are hosted behind providers Langfuse
     # doesn't know about by default (e.g., Databricks-served Llama, internal

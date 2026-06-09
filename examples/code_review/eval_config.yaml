@@ -166,3 +166,29 @@ human_review:
 # small judge models.
 judge_modes: ["anchored"]
 # judge_modes: ["anchored", "blind"]   # uncomment to enable bias detection
+
+# ----------------------------------------------------------------------------
+# Subsetting (optional)
+# ----------------------------------------------------------------------------
+# When set, only the listed folder ids participate in the Cartesian. Empty /
+# omitted = run everything in prompts_dir / test_cases_dir (default behavior).
+#
+# Use cases:
+#   - Quick smoke test: 1 prompt + 1 snippet for a cheap local iteration
+#   - A/B comparison: exactly the two prompts you're comparing this round
+#   - Snippet drilldown: when one snippet misbehaves, subset to just that one
+#
+# The Langfuse Dataset still gets bootstrapped with ALL test cases. The
+# subset only affects which cells get RUN this pass — so toggling subsets
+# doesn't churn the persistent dataset.
+#
+# Missing ids (in the list but not on disk) produce a WARN but don't fail.
+
+prompt_ids: []
+# prompt_ids:
+#   - "structured_reviewer"      # only run this prompt this pass
+
+test_case_ids: []
+# test_case_ids:
+#   - "sql_injection_login"
+#   - "xss_profile_page"          # only run against these two snippets
