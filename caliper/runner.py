@@ -30,7 +30,12 @@ import yaml
 from dotenv import load_dotenv
 from langfuse import Langfuse
 
-from caliper.dataset_bootstrap import bootstrap_dataset, load_test_cases
+from caliper.dataset_bootstrap import (
+    bootstrap_dataset,
+    load_rubrics,
+    load_test_cases,
+    resolve_rubrics_in_cases,
+)
 from caliper.human_review import (
     LangfuseAnnotationClient,
     score_configs_for_rubric,
@@ -186,6 +191,7 @@ def run_eval(
     test_cases_dir = (cfg_dir / config.test_cases_dir).resolve()
     prompts_dir = (cfg_dir / config.prompts_dir).resolve()
     judge_prompts_dir = (cfg_dir / config.judge_prompts_dir).resolve()
+    rubrics_dir = (cfg_dir / config.rubrics_dir).resolve()
 
     langfuse = Langfuse()
     client = LiteLLMProxyClient(retry_config=config.retry)
@@ -195,6 +201,8 @@ def run_eval(
         langfuse=langfuse,
         dataset_name=config.dataset_name,
         test_cases_dir=test_cases_dir,
+        rubrics_dir=rubrics_dir,
+        default_rubric_name=config.default_rubric,
         description=f"Caliper eval campaign: {config.name}",
     )
     print(f"[caliper] dataset has {n_items} item(s)")
@@ -220,7 +228,9 @@ def run_eval(
     dataset_items = _filter_dataset_items(list(dataset.items), config.test_case_ids)
 
     annotation_client, queue_id = _maybe_setup_human_review(
-        config=config, test_cases_dir=test_cases_dir
+        config=config,
+        test_cases_dir=test_cases_dir,
+        rubrics_dir=rubrics_dir,
     )
 
     # Hash-based idempotency: fetch existing cell hashes for this campaign upfront.
@@ -557,6 +567,7 @@ def _maybe_setup_human_review(
     *,
     config: EvalConfig,
     test_cases_dir: Path,
+    rubrics_dir: Path,
 ) -> tuple[LangfuseAnnotationClient | None, str | None]:
     """Set up human-review queue + score configs if configured.
 
@@ -573,7 +584,11 @@ def _maybe_setup_human_review(
         return None, None
 
     try:
+        rubrics = load_rubrics(rubrics_dir)
         cases = load_test_cases(test_cases_dir)
+        cases = resolve_rubrics_in_cases(cases, rubrics, config.default_rubric)
+        # POC assumption: all test cases in this pass share rubric dim names,
+        # so the first one is representative for ScoreConfig derivation.
         rubric = cases[0][2].rubric
     except Exception as e:
         print(
@@ -658,10 +673,14 @@ def _run_one(
     ) as parent:
         # cell_hash tag is what idempotency checks against on later runs.
         # Stamp it both as a tag (for fast filter) and in metadata (for query).
+        # `test_case:<id>` is the generic tag that scales beyond the original
+        # code-review use case (agent eval inputs, customer-service queries,
+        # etc.). The `code_snippet:` tag was a domain leak from the original
+        # sample; this is the corrected generic shape.
         tags = [
             f"prompt:{prompt_id}",
             f"model:{model}",
-            f"code_snippet:{item.id}",
+            f"test_case:{item.id}",
             f"iteration:{iteration}",
             f"eval_type:{test_case_meta.eval_type}",
             f"campaign:{config.name}",
@@ -669,7 +688,7 @@ def _run_one(
         metadata: dict[str, object] = {
             "prompt_id": prompt_id,
             "model": model,
-            "code_snippet": item.id,
+            "test_case": item.id,
             "iteration": iteration,
             "eval_type": test_case_meta.eval_type,
             "campaign": config.name,

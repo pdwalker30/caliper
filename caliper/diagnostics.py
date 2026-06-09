@@ -140,6 +140,7 @@ def probe_eval_config_paths(config_path: Path) -> list[CheckResult]:
         ("test_cases_dir", "test_cases_dir"),
         ("prompts_dir", "prompts_dir"),
         ("judge_prompts_dir", "judge_prompts_dir"),
+        ("rubrics_dir", "rubrics_dir"),
     ]:
         path = (cfg_dir / getattr(config, attr)).resolve()
         if path.is_dir():
@@ -167,10 +168,17 @@ def probe_human_review(config: EvalConfig, config_path: Path) -> list[CheckResul
         return results
 
     try:
-        from caliper.dataset_bootstrap import load_test_cases
+        from caliper.dataset_bootstrap import (
+            load_rubrics,
+            load_test_cases,
+            resolve_rubrics_in_cases,
+        )
 
         test_cases_dir = (config_path.parent / config.test_cases_dir).resolve()
+        rubrics_dir = (config_path.parent / config.rubrics_dir).resolve()
+        rubrics = load_rubrics(rubrics_dir)
         cases = load_test_cases(test_cases_dir)
+        cases = resolve_rubrics_in_cases(cases, rubrics, config.default_rubric)
         if not cases:
             results.append(
                 CheckResult(

@@ -1,40 +1,7 @@
 {
   "eval_type": "code_review",
   "description": "Path traversal vulnerability: the `file` query parameter is concatenated into a filesystem path with no validation. An attacker can request '../../etc/passwd' to escape the upload directory. Severity: High.",
-  "rubric": {
-    "dimensions": [
-      {
-        "name": "finds_bug",
-        "description": "Does the review correctly identify the seeded vulnerability? Score 1.0 if the LLM names the specific vulnerability class (e.g., 'path traversal' or 'directory traversal'); 0.5 if it identifies the vulnerable area but mislabels it; 0.0 if it misses the vulnerability entirely.",
-        "weight": 0.4,
-        "pass_threshold": 0.7,
-        "scale": "0-1"
-      },
-      {
-        "name": "severity_accuracy",
-        "description": "How accurately does the LLM rate the severity? Compare against the expected true_severity in the reference. Score 1.0 if exactly correct, 0.5 if off by one tier (e.g., said Medium when truly High), 0.0 if rated Low or not-a-concern when truly High or Critical.",
-        "weight": 0.25,
-        "pass_threshold": 0.7,
-        "scale": "0-1"
-      },
-      {
-        "name": "actionability",
-        "description": "Did the LLM give concrete, specific remediation steps that a developer could act on directly? Specific code patterns or named techniques score higher; vague guidance like 'sanitize input' alone scores lower.",
-        "weight": 0.25,
-        "pass_threshold": 0.6,
-        "scale": "0-1"
-      },
-      {
-        "name": "no_false_alarms",
-        "description": "Did the LLM avoid inventing additional bugs that aren't actually present in the code? Score 1.0 if the review only flags real issues. Penalize spurious 'might also consider...' findings that aren't grounded in the actual code.",
-        "weight": 0.1,
-        "pass_threshold": 0.7,
-        "scale": "0-1"
-      }
-    ],
-    "aggregation": "weighted_mean",
-    "overall_pass_threshold": 0.7
-  },
+  "rubric": "standard-code-review",
   "expected": {
     "vulnerability_kind": "path_traversal",
     "true_severity": "high",

@@ -34,24 +34,33 @@ via Pydantic; deviation fails fast with a clear error.
 ```
 <your_eval>/
 ├── eval_config.yaml                ← the top-level driver
-├── code_snippets/                  ← test_cases_dir in eval_config.yaml
-│   ├── <snippet_id_1>/
+├── code_snippets/                  ← test_cases_dir (configurable name)
+│   ├── <test_case_id_1>/
 │   │   ├── <content_file>          ← any filename EXCEPT metadata.json
 │   │   └── metadata.json           ← TestCaseMetadata
-│   ├── <snippet_id_2>/
+│   ├── <test_case_id_2>/
 │   │   ├── ...
 │   │   └── ...
 │   └── ...
-├── prompts/                        ← prompts_dir
+├── prompts/                        ← prompts_dir (configurable name)
 │   ├── <prompt_id_1>/
 │   │   ├── prompt.txt              ← fixed filename
 │   │   └── metadata.json           ← PromptMetadata
 │   └── ...
-└── judge_prompts/                  ← judge_prompts_dir
-    └── <judge_id>/
-        ├── judge_prompt.txt        ← fixed filename
-        └── metadata.json           ← JudgePromptMetadata
+├── judge_prompts/                  ← judge_prompts_dir (configurable name)
+│   └── <judge_id>/
+│       ├── judge_prompt.txt        ← fixed filename
+│       └── metadata.json           ← JudgePromptMetadata
+└── rubrics/                        ← rubrics_dir (configurable name)
+    └── <rubric_id>/
+        └── rubric.json             ← Rubric (dimensions, weights, thresholds)
 ```
+
+The folder names (`code_snippets/`, `prompts/`, etc.) are conventional —
+all four are configurable via `*_dir` fields in `eval_config.yaml`. If your
+domain isn't code review, name them whatever fits: `inputs/`, `queries/`,
+`agent_scenarios/`, etc. The framework only cares about the field references
+in the config.
 
 The folder name IS the asset id. `<snippet_id>` becomes the Langfuse
 DatasetItem id (idempotent across re-runs). `<prompt_id>` becomes the

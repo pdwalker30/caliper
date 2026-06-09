@@ -33,12 +33,16 @@ class RubricDimension(BaseModel):
 class Rubric(BaseModel):
     """A rubric — multiple dimensions plus aggregation policy.
 
-    Lives on `TestCaseMetadata.rubric`. The judge reads this and emits one
-    DimensionScore per dimension plus an aggregate overall score.
+    Rubrics are first-class reusable artifacts that live in rubrics_dir as
+    `rubrics/<name>/rubric.json`. Test cases reference them by name (string)
+    via `TestCaseMetadata.rubric`, or fall through to the config's
+    `default_rubric`. Inline Rubric objects on test cases are still accepted
+    (deprecated) for backward compat.
     """
 
     model_config = ConfigDict(extra="forbid")
 
+    description: str = ""
     dimensions: list[RubricDimension]
     aggregation: Literal["weighted_mean", "min", "max"] = "weighted_mean"
     overall_pass_threshold: float = Field(ge=0, le=1, default=0.7)
@@ -55,13 +59,20 @@ class TestCaseMetadata(BaseModel):
     `eval_type` is the discriminator that routes to the right judge adapter
     later (code_review, agent_tool_call, agent_outcome, ...). `expected`
     holds eval-type-specific reference data (seeded bugs, required tools,
-    expected outcomes, etc.). Extra fields are allowed for forward-compat.
+    expected outcomes, etc.).
+
+    `rubric` accepts three shapes:
+      - Rubric object (inline) — deprecated; emits a WARN on load
+      - str (name)             — resolved against rubrics_dir at load time
+      - None                   — falls through to EvalConfig.default_rubric
+
+    Extra fields are allowed for forward-compat.
     """
 
     model_config = ConfigDict(extra="allow")
 
     eval_type: str
-    rubric: Rubric
+    rubric: Rubric | str | None = None
     expected: dict[str, Any] = Field(default_factory=dict)
     description: str = ""
     tags: list[str] = Field(default_factory=list)
@@ -207,6 +218,13 @@ class EvalConfig(BaseModel):
     test_cases_dir: str
     prompts_dir: str
     judge_prompts_dir: str
+    # Folder containing rubrics, parallel to prompts/ and judge_prompts/.
+    # Each rubric is a sub-folder with rubric.json. Test cases reference
+    # rubrics by name; the framework resolves them at load time.
+    rubrics_dir: str = "rubrics"
+    # Default rubric used when a test case doesn't specify one. Required
+    # only if any test case omits its `rubric` field.
+    default_rubric: str | None = None
     judge_prompt: str
     judge_model: str
     models: list[str] = Field(min_length=1)

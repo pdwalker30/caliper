@@ -30,6 +30,8 @@ dataset_name: "caliper-sample-code-snippets-v1"
 test_cases_dir: "code_snippets"
 prompts_dir: "prompts"
 judge_prompts_dir: "judge_prompts"
+rubrics_dir: "rubrics"                    # NEW — first-class rubric folder
+default_rubric: "standard-code-review"    # NEW — used when a test case omits its `rubric` field
 
 # ----------------------------------------------------------------------------
 # Judge configuration
