@@ -148,10 +148,10 @@ class RetryConfig(BaseModel):
 class HumanReviewConfig(BaseModel):
     """Optional human-in-the-loop calibration of the LLM judge.
 
-    When enabled, the eval runner samples N traces per Dataset Run and
-    enqueues them into a Langfuse Annotation Queue for manual scoring.
-    Caliper's calibration module then reads paired (LLM, human) scores and
-    reports agreement metrics so you know how much to trust the LLM judge.
+    When enabled, the eval runner samples N traces and enqueues them into a
+    Langfuse Annotation Queue for manual scoring. Caliper's calibration
+    module then reads paired (LLM, human) scores and reports agreement
+    metrics so you know how much to trust the LLM judge.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -160,10 +160,28 @@ class HumanReviewConfig(BaseModel):
     queue_name: str = "caliper-human-review"
 
     # How traces are selected for human review:
-    #   stratified: N samples per (prompt, model) Run (deterministic order)
+    #   auto:       Caliper picks target N from min/max samples + min/max pct
+    #               below, distributed evenly across Runs. RECOMMENDED.
+    #   stratified: explicit N samples per Run via `samples_per_run`
     #   random:     coin flip per trace with `sample_rate` probability
     #   all:        every trace goes to the queue (don't do this with humans)
-    sample_strategy: Literal["stratified", "random", "all"] = "stratified"
+    sample_strategy: Literal["auto", "stratified", "random", "all"] = "auto"
+
+    # Auto strategy: caps and floors. Caliper picks an effective sample
+    # count that's:
+    #   - at least max(min_samples, ceil(min_pct * total_cells))
+    #   - at most min(max_samples, ceil(max_pct * total_cells), total_cells)
+    # When constraints conflict (big matrices), ceiling wins to protect
+    # human time. Defaults derived from inter-rater-reliability literature:
+    # below n=20 the CI on κ and r becomes uninformative; past n=100 the CIs
+    # are already narrow enough that more samples don't change conclusions.
+    min_samples: int = Field(ge=0, default=20)
+    min_pct: float = Field(ge=0, le=1, default=0.05)
+    max_samples: int = Field(ge=1, default=100)
+    max_pct: float = Field(ge=0, le=1, default=0.20)
+
+    # Legacy / explicit overrides — respected when sample_strategy is set to
+    # the matching value. The auto strategy ignores these.
     samples_per_run: int = Field(ge=1, default=2)
     sample_rate: float = Field(ge=0, le=1, default=0.15)
 
@@ -202,6 +220,19 @@ class EvalConfig(BaseModel):
     extra_run_metadata: dict[str, Any] = Field(default_factory=dict)
     human_review: HumanReviewConfig | None = None
     retry: RetryConfig = Field(default_factory=RetryConfig)
+    # Judge modes to run per cell. "anchored" gives the judge the test case's
+    # expected/ground-truth reference; "blind" hides it so the judge scores
+    # using only the code + the LLM's review. Running both side-by-side
+    # surfaces reference bias: if anchored consistently scores higher than
+    # blind, the LLM under test is being artificially rewarded by the
+    # judge already knowing the answer.
+    #
+    # Scores from the blind mode get a __blind suffix on every score name
+    # (e.g., `finds_bug__blind`, `finds_bug__pass__blind`) so they coexist
+    # with the anchored scores on the same trace.
+    judge_modes: list[Literal["anchored", "blind"]] = Field(
+        default_factory=lambda: ["anchored"]
+    )
     # Map LiteLLM-returned model names to names Langfuse's built-in pricing
     # map recognizes. Needed when models are hosted behind providers Langfuse
     # doesn't know about by default (e.g., Databricks-served Llama, internal

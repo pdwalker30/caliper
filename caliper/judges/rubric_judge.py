@@ -21,7 +21,7 @@ reason about and one fewer dep. Swap to Jinja later if templates get richer.
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Literal
 
 from caliper.judges.base import JudgeAdapter
 from caliper.litellm_client import LiteLLMProxyClient
@@ -32,6 +32,8 @@ from caliper.schemas import (
     Rubric,
     TestCaseMetadata,
 )
+
+JudgeMode = Literal["anchored", "blind"]
 
 
 class RubricJudge(JudgeAdapter):
@@ -57,8 +59,11 @@ class RubricJudge(JudgeAdapter):
         test_case_metadata: TestCaseMetadata,
         llm_output: str,
         trace_observations: list[Any] | None = None,
+        mode: JudgeMode = "anchored",
     ) -> JudgeVerdict:
-        rendered = self._render_prompt(test_case_input, test_case_metadata, llm_output)
+        rendered = self._render_prompt(
+            test_case_input, test_case_metadata, llm_output, mode=mode
+        )
 
         result = self.client.complete(
             model=self.judge_model,
@@ -84,6 +89,7 @@ class RubricJudge(JudgeAdapter):
         test_case_input: str,
         test_case_metadata: TestCaseMetadata,
         llm_output: str,
+        mode: JudgeMode = "anchored",
     ) -> str:
         rubric = test_case_metadata.rubric
 
@@ -98,6 +104,18 @@ class RubricJudge(JudgeAdapter):
         }
         response_format_example = json.dumps(example_obj, indent=2)
 
+        # In blind mode, the judge does NOT see the ground-truth reference.
+        # It scores using only the code + the LLM's review + the rubric
+        # dimension descriptions. Running both modes side-by-side surfaces
+        # how much the reference is biasing the anchored scores upward.
+        if mode == "blind":
+            expected_str = (
+                "(reference deliberately withheld — judge based solely on the "
+                "code, the rubric dimensions, and the review below)"
+            )
+        else:
+            expected_str = json.dumps(test_case_metadata.expected, indent=2)
+
         # Use sequential .replace() rather than .format() — test case content
         # often contains literal {curly_braces} (code, JSON examples) that
         # would break str.format.
@@ -105,7 +123,7 @@ class RubricJudge(JudgeAdapter):
         replacements = {
             "{test_case_input}": test_case_input,
             "{test_case_description}": test_case_metadata.description,
-            "{expected_json}": json.dumps(test_case_metadata.expected, indent=2),
+            "{expected_json}": expected_str,
             "{rubric_dimensions}": dimensions_block,
             "{llm_output}": llm_output,
             "{response_format_example}": response_format_example,

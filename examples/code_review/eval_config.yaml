@@ -134,6 +134,35 @@ idempotent: true
 human_review:
   enabled: false
   queue_name: "code-review-sample-calibration"
-  sample_strategy: "stratified"
-  samples_per_run: 2
+  # "auto" picks target sample count from caps + floors below, distributed
+  # evenly across Runs. Recommended over "stratified" or "random" because it
+  # adapts to matrix size: tiny matrices get all samples, huge matrices get
+  # capped at max_samples to protect human time.
+  sample_strategy: "auto"
+  min_samples: 20      # statistical floor — below ~20, calibration CIs explode
+  min_pct: 0.05        # OR 5% of total cells, whichever is larger
+  max_samples: 100     # human-time ceiling — diminishing returns past 100
+  max_pct: 0.20        # OR 20% of total, whichever is smaller
   auto_create: true
+  # samples_per_run: 2     # only used when sample_strategy = "stratified"
+  # sample_rate: 0.15      # only used when sample_strategy = "random"
+
+# ----------------------------------------------------------------------------
+# Judge modes
+# ----------------------------------------------------------------------------
+# "anchored" judge sees the test case's expected/ground-truth reference.
+# "blind"    judge sees only the code + the LLM's review (no cheat sheet).
+#
+# Running both side-by-side detects reference bias. If anchored scores
+# are consistently 0.2+ higher than blind, the LLM under test is being
+# rewarded for "guessing" what the judge already knows. The blind score
+# is the better proxy for production behavior (reviewers in real use
+# don't have the reference).
+#
+# Blind scores get a __blind suffix on every score name in Langfuse:
+# `finds_bug__blind`, `finds_bug__pass__blind`, `overall__blind`, etc.
+#
+# Cost: each extra mode = one extra judge call per cell. Cheap with
+# small judge models.
+judge_modes: ["anchored"]
+# judge_modes: ["anchored", "blind"]   # uncomment to enable bias detection

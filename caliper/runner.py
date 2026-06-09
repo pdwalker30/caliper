@@ -40,6 +40,7 @@ from caliper.judges.rubric_judge import RubricJudge
 from caliper.litellm_client import LiteLLMProxyClient
 from caliper.schemas import (
     EvalConfig,
+    HumanReviewConfig,
     JudgePromptMetadata,
     PromptMetadata,
     TestCaseMetadata,
@@ -328,29 +329,102 @@ def _build_submissions(
                 )
 
     # Pre-compute sample flags (deterministic; no threaded mutation).
+    submissions: list[dict] = []
+    for run_subs in by_run.values():
+        submissions.extend(run_subs)
+
     if (
         config.human_review
         and config.human_review.enabled
         and queue_id is not None
     ):
-        strategy = config.human_review.sample_strategy
-        rng = random.Random(0xC4117E5)
-        for run_subs in by_run.values():
-            if strategy == "all":
-                for s in run_subs:
-                    s["should_sample"] = True
-            elif strategy == "stratified":
-                n = config.human_review.samples_per_run
-                for s in run_subs[:n]:
-                    s["should_sample"] = True
-            elif strategy == "random":
-                for s in run_subs:
-                    s["should_sample"] = rng.random() < config.human_review.sample_rate
+        _apply_sample_flags(submissions, by_run, config.human_review)
 
-    submissions: list[dict] = []
-    for run_subs in by_run.values():
-        submissions.extend(run_subs)
     return submissions, skipped
+
+
+def _compute_auto_target(total: int, cfg: HumanReviewConfig) -> int:
+    """Compute the effective sample count from caps + floors.
+
+    floor   = max(min_samples, ceil(min_pct * total))
+    ceiling = min(max_samples, ceil(max_pct * total))
+    target  = clamp(ceiling, [0, total])
+    if target < floor and total > target:
+        target = min(floor, total)
+
+    When the floor exceeds the ceiling (big matrices with high min_pct
+    + low max_samples), the ceiling wins to protect human time.
+    """
+    import math
+
+    floor = max(cfg.min_samples, math.ceil(cfg.min_pct * total))
+    ceiling = min(cfg.max_samples, math.ceil(cfg.max_pct * total))
+    target = min(ceiling, total)
+    if target < floor and total > target:
+        target = min(floor, total)
+    return target
+
+
+def _apply_sample_flags(
+    submissions: list[dict],
+    by_run: dict[str, list[dict]],
+    cfg: HumanReviewConfig,
+) -> None:
+    """Mark which submissions get sampled into the human review queue.
+
+    Modifies submission dicts in place. Strategies:
+      auto       — caps + floors; even distribution across Runs
+      stratified — explicit `samples_per_run` per Run
+      random     — coin flip per cell with `sample_rate` probability
+      all        — every cell goes to the queue
+    """
+    import math
+
+    strategy = cfg.sample_strategy
+    rng = random.Random(0xC4117E5)
+
+    if strategy == "all":
+        for s in submissions:
+            s["should_sample"] = True
+        return
+
+    if strategy == "random":
+        for s in submissions:
+            s["should_sample"] = rng.random() < cfg.sample_rate
+        return
+
+    if strategy == "stratified":
+        for run_subs in by_run.values():
+            for s in run_subs[: cfg.samples_per_run]:
+                s["should_sample"] = True
+        return
+
+    # strategy == "auto"
+    total = len(submissions)
+    if total == 0:
+        return
+    target = _compute_auto_target(total, cfg)
+    n_runs = len([rs for rs in by_run.values() if rs])
+    if n_runs == 0:
+        return
+    per_run = math.ceil(target / n_runs)
+    # Allocate per_run to each Run, then trim from the tail to hit target exactly
+    allocated = 0
+    for run_subs in by_run.values():
+        if not run_subs:
+            continue
+        take = min(per_run, len(run_subs), max(0, target - allocated))
+        for s in run_subs[:take]:
+            s["should_sample"] = True
+        allocated += take
+        if allocated >= target:
+            break
+    print(
+        f"[caliper] human review auto-sampling: target={target} "
+        f"(floor={max(cfg.min_samples, math.ceil(cfg.min_pct * total))}, "
+        f"ceiling={min(cfg.max_samples, math.ceil(cfg.max_pct * total))}, "
+        f"total_cells={total}, runs={n_runs})"
+    )
 
 
 def _run_one_wrapped(
@@ -581,46 +655,68 @@ def _run_one(
                 model=_langfuse_model(result.model, config.langfuse_model_mapping),
             )
 
-        # ----- 2. The judge -----
-        with parent.start_as_current_generation(
-            name="judge",
-            model=_langfuse_model(config.judge_model, config.langfuse_model_mapping),
-            input=[{"role": "system", "content": "Caliper rubric judge"}],
-        ) as judge_gen:
-            verdict = judge.evaluate(
-                test_case_input=test_case_text,
-                test_case_metadata=test_case_meta,
-                llm_output=result.output,
-            )
-            judge_gen.update(
-                output=verdict.model_dump(exclude={"raw_response"}),
-            )
+        # ----- 2. The judge (per configured mode) -----
+        # Anchored mode = judge sees expected/reference data (current default).
+        # Blind mode    = judge sees only the code + review (reference withheld).
+        # Running both surfaces reference bias: gap between anchored and blind
+        # scores tells you how much the cheat sheet is propping up the judge.
+        verdicts_by_mode: dict[str, Any] = {}
+        for mode in config.judge_modes:
+            gen_name = "judge" if mode == "anchored" else f"judge:{mode}"
+            with parent.start_as_current_generation(
+                name=gen_name,
+                model=_langfuse_model(config.judge_model, config.langfuse_model_mapping),
+                input=[{"role": "system", "content": f"Caliper rubric judge ({mode})"}],
+            ) as judge_gen:
+                verdict = judge.evaluate(
+                    test_case_input=test_case_text,
+                    test_case_metadata=test_case_meta,
+                    llm_output=result.output,
+                    mode=mode,
+                )
+                judge_gen.update(
+                    output=verdict.model_dump(exclude={"raw_response"}),
+                )
+            verdicts_by_mode[mode] = verdict
+
+        # The anchored verdict is the primary one (backward compat with the
+        # existing report shape). Fall back to the first mode's verdict if
+        # anchored isn't in the list.
+        primary_verdict = verdicts_by_mode.get(
+            "anchored", next(iter(verdicts_by_mode.values()))
+        )
 
         parent.update(
             output={
                 "generated": result.output,
-                "verdict": verdict.model_dump(exclude={"raw_response"}),
+                "verdict": primary_verdict.model_dump(exclude={"raw_response"}),
+                "verdict_modes": list(verdicts_by_mode.keys()),
             },
         )
 
         # ----- 3. Scores -----
-        for dim_name, dim_score in verdict.dimensions.items():
+        # Anchored mode emits unsuffixed names (backward compat). Other modes
+        # emit `<dim>__<mode>` and `<dim>__pass__<mode>`. So `finds_bug` is
+        # the anchored score; `finds_bug__blind` is the blind variant.
+        for mode, verdict in verdicts_by_mode.items():
+            suffix = "" if mode == "anchored" else f"__{mode}"
+            for dim_name, dim_score in verdict.dimensions.items():
+                parent.score_trace(
+                    name=f"{dim_name}{suffix}",
+                    value=dim_score.value,
+                    comment=dim_score.reasoning[:1000],
+                )
+                parent.score_trace(
+                    name=f"{dim_name}__pass{suffix}",
+                    value=1 if dim_score.passed else 0,
+                    data_type="BOOLEAN",
+                )
+            parent.score_trace(name=f"overall{suffix}", value=verdict.overall_value)
             parent.score_trace(
-                name=dim_name,
-                value=dim_score.value,
-                comment=dim_score.reasoning[:1000],
-            )
-            parent.score_trace(
-                name=f"{dim_name}__pass",
-                value=1 if dim_score.passed else 0,
+                name=f"overall__pass{suffix}",
+                value=1 if verdict.overall_passed else 0,
                 data_type="BOOLEAN",
             )
-        parent.score_trace(name="overall", value=verdict.overall_value)
-        parent.score_trace(
-            name="overall__pass",
-            value=1 if verdict.overall_passed else 0,
-            data_type="BOOLEAN",
-        )
 
         # ----- 4. Optional: enqueue for human review -----
         # should_sample was pre-computed in _build_submissions so the parallel
