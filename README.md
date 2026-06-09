@@ -214,8 +214,11 @@ dataset_name: "code-eval-snippets-v1"
 test_cases_dir: "code_snippets"
 prompts_dir: "prompts"
 judge_prompts_dir: "judge_prompts"
-rubrics_dir: "rubrics"               # NEW — first-class rubric folder
-default_rubric: "standard-rubric"    # used when a test case omits its rubric
+rubrics_dir: "rubrics"               # first-class rubric folder
+default_rubric: "standard-rubric"    # used for every test case's eval_type
+# rubric_by_eval_type:               # optional per-eval-type override
+#   code_review: "standard-code-review"
+#   agent_tool_call: "agent-tool-call-standard"
 judge_prompt: "rubric_judge_v1"      # folder name under judge_prompts/
 judge_model: "gpt-4o-mini"           # alias from litellm_config.yaml
 models:                              # aliases from litellm_config.yaml

@@ -1,7 +1,6 @@
 {
   "eval_type": "code_review",
   "description": "Reflected XSS: user-controlled `name` and `bio` query params are interpolated into the HTML response without escaping. An attacker can craft a URL with malicious script tags in either field to execute arbitrary JavaScript in a victim's browser. Severity: High.",
-  "rubric": "standard-code-review",
   "expected": {
     "vulnerability_kind": "xss_reflected",
     "true_severity": "high",

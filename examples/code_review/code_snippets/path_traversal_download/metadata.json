@@ -1,7 +1,6 @@
 {
   "eval_type": "code_review",
   "description": "Path traversal vulnerability: the `file` query parameter is concatenated into a filesystem path with no validation. An attacker can request '../../etc/passwd' to escape the upload directory. Severity: High.",
-  "rubric": "standard-code-review",
   "expected": {
     "vulnerability_kind": "path_traversal",
     "true_severity": "high",

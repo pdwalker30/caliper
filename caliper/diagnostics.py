@@ -171,14 +171,13 @@ def probe_human_review(config: EvalConfig, config_path: Path) -> list[CheckResul
         from caliper.dataset_bootstrap import (
             load_rubrics,
             load_test_cases,
-            resolve_rubrics_in_cases,
+            resolve_rubric_for_eval_type,
         )
 
         test_cases_dir = (config_path.parent / config.test_cases_dir).resolve()
         rubrics_dir = (config_path.parent / config.rubrics_dir).resolve()
         rubrics = load_rubrics(rubrics_dir)
         cases = load_test_cases(test_cases_dir)
-        cases = resolve_rubrics_in_cases(cases, rubrics, config.default_rubric)
         if not cases:
             results.append(
                 CheckResult(
@@ -186,7 +185,14 @@ def probe_human_review(config: EvalConfig, config_path: Path) -> list[CheckResul
                 )
             )
             return results
-        rubric = cases[0][2].rubric
+        # Use first case's eval_type to derive a representative rubric for
+        # the ScoreConfig check.
+        rubric = resolve_rubric_for_eval_type(
+            cases[0][2].eval_type,
+            rubrics,
+            config.default_rubric,
+            config.rubric_by_eval_type,
+        )
         specs = score_configs_for_rubric(rubric)
         existing = {cfg["name"]: cfg for cfg in client.list_score_configs()}
         missing = [s.name for s in specs if s.name not in existing]

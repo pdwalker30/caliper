@@ -57,68 +57,55 @@ def load_rubrics(rubrics_dir: Path) -> dict[str, Rubric]:
     return rubrics
 
 
-def resolve_rubric(
-    test_case_id: str,
-    test_case_meta: TestCaseMetadata,
+def resolve_rubric_for_eval_type(
+    eval_type: str,
     rubrics: dict[str, Rubric],
     default_rubric_name: str | None,
+    rubric_by_eval_type: dict[str, str],
 ) -> Rubric:
-    """Resolve which Rubric applies to this test case.
+    """Resolve which Rubric applies given a test case's eval_type.
 
-    Priority:
-      1. test_case_meta.rubric as Rubric object (inline; deprecated)
-      2. test_case_meta.rubric as string (named reference)
-      3. default_rubric_name from EvalConfig
+    Resolution order:
+      1. rubric_by_eval_type[eval_type] — if eval_type is keyed here
+      2. default_rubric_name from EvalConfig
+      3. ValueError if neither is set
     """
-    r = test_case_meta.rubric
-    if isinstance(r, Rubric):
-        print(
-            f"[caliper] WARN: test case {test_case_id!r} uses an inline rubric "
-            f"in metadata.json — this is deprecated. Extract it into "
-            f"rubrics/<name>/rubric.json and reference by name for DRY rubric "
-            f"definitions.",
-            file=sys.stderr,
-        )
-        return r
-    if isinstance(r, str):
-        if r not in rubrics:
-            available = sorted(rubrics.keys()) or "(none)"
-            raise ValueError(
-                f"Test case {test_case_id!r} references rubric {r!r} but it "
-                f"was not found in rubrics_dir. Available: {available}"
-            )
-        return rubrics[r]
-    # r is None
-    if default_rubric_name is None:
+    # Per-eval-type override wins if set
+    name = rubric_by_eval_type.get(eval_type) or default_rubric_name
+    if name is None:
         raise ValueError(
-            f"Test case {test_case_id!r} has no rubric and EvalConfig has no "
-            f"default_rubric. Set one of: TestCaseMetadata.rubric or "
-            f"EvalConfig.default_rubric."
+            f"No rubric available for eval_type {eval_type!r}. Set one of: "
+            f"EvalConfig.default_rubric, or "
+            f"EvalConfig.rubric_by_eval_type[{eval_type!r}]."
         )
-    if default_rubric_name not in rubrics:
+    if name not in rubrics:
         available = sorted(rubrics.keys()) or "(none)"
         raise ValueError(
-            f"EvalConfig.default_rubric is {default_rubric_name!r} but it "
-            f"was not found in rubrics_dir. Available: {available}"
+            f"Rubric {name!r} (requested for eval_type {eval_type!r}) was "
+            f"not found in rubrics_dir. Available: {available}"
         )
-    return rubrics[default_rubric_name]
+    return rubrics[name]
 
 
-def resolve_rubrics_in_cases(
+def attach_rubrics_to_cases(
     cases: list[tuple[str, str, TestCaseMetadata]],
     rubrics: dict[str, Rubric],
     default_rubric_name: str | None,
-) -> list[tuple[str, str, TestCaseMetadata]]:
-    """Walk all loaded test cases and inline the resolved Rubric.
+    rubric_by_eval_type: dict[str, str],
+) -> list[tuple[str, str, TestCaseMetadata, Rubric]]:
+    """Walk loaded test cases and attach the resolved Rubric.
 
-    After this runs, every TestCaseMetadata.rubric is a Rubric object —
-    downstream code (judge, score emission, hash computation, dataset
-    metadata) doesn't have to handle the union shape.
+    Returns a list of (case_id, content, meta, resolved_rubric) tuples.
+    Downstream code reads the resolved Rubric from the 4th element rather
+    than from TestCaseMetadata (which no longer carries it).
     """
-    for case_id, _, meta in cases:
-        resolved = resolve_rubric(case_id, meta, rubrics, default_rubric_name)
-        meta.rubric = resolved
-    return cases
+    out: list[tuple[str, str, TestCaseMetadata, Rubric]] = []
+    for case_id, content, meta in cases:
+        rubric = resolve_rubric_for_eval_type(
+            meta.eval_type, rubrics, default_rubric_name, rubric_by_eval_type
+        )
+        out.append((case_id, content, meta, rubric))
+    return out
 
 
 def load_test_cases(
@@ -166,15 +153,13 @@ def bootstrap_dataset(
     langfuse: Langfuse,
     dataset_name: str,
     test_cases_dir: Path,
-    rubrics_dir: Path,
-    default_rubric_name: str | None,
     description: str = "",
 ) -> int:
     """Create the dataset (if needed) and upsert one item per test case.
 
-    Resolves each test case's rubric reference into an inlined Rubric BEFORE
-    sending to Langfuse, so the DatasetItem metadata in Langfuse always
-    contains the full Rubric (rather than just a name string).
+    Test case metadata is sent as-is — no rubric. Rubrics live entirely in
+    eval_config land and are resolved per cell by the runner based on each
+    test case's eval_type.
 
     Idempotent: Langfuse's create_dataset / create_dataset_item APIs are upsert-
     on-name and upsert-on-id respectively. Re-running with the same inputs
@@ -182,10 +167,7 @@ def bootstrap_dataset(
     """
     langfuse.create_dataset(name=dataset_name, description=description)
 
-    rubrics = load_rubrics(rubrics_dir)
     cases = load_test_cases(test_cases_dir)
-    cases = resolve_rubrics_in_cases(cases, rubrics, default_rubric_name)
-
     for case_id, content, metadata in cases:
         langfuse.create_dataset_item(
             dataset_name=dataset_name,

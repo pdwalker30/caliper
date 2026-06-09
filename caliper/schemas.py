@@ -56,23 +56,21 @@ class Rubric(BaseModel):
 class TestCaseMetadata(BaseModel):
     """`metadata.json` next to a test-case content file.
 
-    `eval_type` is the discriminator that routes to the right judge adapter
-    later (code_review, agent_tool_call, agent_outcome, ...). `expected`
-    holds eval-type-specific reference data (seeded bugs, required tools,
-    expected outcomes, etc.).
+    Test cases hold PURE INPUT DATA — what's being evaluated and its ground
+    truth. They do NOT declare which rubric to use; that's an eval-pass
+    orchestration concern that lives in EvalConfig. The `eval_type` field
+    is the only contract between test data and evaluation logic — the
+    EvalConfig maps eval_types to rubrics via default_rubric or
+    rubric_by_eval_type.
 
-    `rubric` accepts three shapes:
-      - Rubric object (inline) — deprecated; emits a WARN on load
-      - str (name)             — resolved against rubrics_dir at load time
-      - None                   — falls through to EvalConfig.default_rubric
-
-    Extra fields are allowed for forward-compat.
+    `expected` holds eval-type-specific reference data (seeded bugs,
+    required tools, expected outcomes, etc.). Extra fields are allowed
+    for forward-compat.
     """
 
     model_config = ConfigDict(extra="allow")
 
     eval_type: str
-    rubric: Rubric | str | None = None
     expected: dict[str, Any] = Field(default_factory=dict)
     description: str = ""
     tags: list[str] = Field(default_factory=list)
@@ -219,12 +217,19 @@ class EvalConfig(BaseModel):
     prompts_dir: str
     judge_prompts_dir: str
     # Folder containing rubrics, parallel to prompts/ and judge_prompts/.
-    # Each rubric is a sub-folder with rubric.json. Test cases reference
-    # rubrics by name; the framework resolves them at load time.
+    # Each rubric is a sub-folder with rubric.json. Test cases do NOT
+    # reference rubrics — assignment lives entirely in this config.
     rubrics_dir: str = "rubrics"
-    # Default rubric used when a test case doesn't specify one. Required
-    # only if any test case omits its `rubric` field.
+    # Default rubric used for every test case unless rubric_by_eval_type
+    # carries a more specific mapping for that test case's eval_type.
+    # Required in practice — without it, test cases have no rubric.
     default_rubric: str | None = None
+    # Optional per-eval-type rubric override. When set, a test case whose
+    # eval_type matches a key here uses the mapped rubric; otherwise it
+    # falls through to default_rubric. Useful when a single eval pass mixes
+    # multiple eval_types (e.g., code_review + agent_tool_call in one
+    # campaign) and each type wants its own scoring scheme.
+    rubric_by_eval_type: dict[str, str] = Field(default_factory=dict)
     judge_prompt: str
     judge_model: str
     models: list[str] = Field(min_length=1)

@@ -57,12 +57,13 @@ class RubricJudge(JudgeAdapter):
         self,
         test_case_input: str,
         test_case_metadata: TestCaseMetadata,
+        rubric: Rubric,
         llm_output: str,
         trace_observations: list[Any] | None = None,
         mode: JudgeMode = "anchored",
     ) -> JudgeVerdict:
         rendered = self._render_prompt(
-            test_case_input, test_case_metadata, llm_output, mode=mode
+            test_case_input, test_case_metadata, rubric, llm_output, mode=mode
         )
 
         result = self.client.complete(
@@ -80,7 +81,7 @@ class RubricJudge(JudgeAdapter):
                 f"Judge returned non-JSON response: {e}\n\nRaw:\n{result.output[:2000]}"
             ) from e
 
-        return self._parse_verdict(data, test_case_metadata.rubric, raw=result.output)
+        return self._parse_verdict(data, rubric, raw=result.output)
 
     # ------------------------------------------------------------------ render
 
@@ -88,11 +89,10 @@ class RubricJudge(JudgeAdapter):
         self,
         test_case_input: str,
         test_case_metadata: TestCaseMetadata,
+        rubric: Rubric,
         llm_output: str,
         mode: JudgeMode = "anchored",
     ) -> str:
-        rubric = test_case_metadata.rubric
-
         dimensions_block = "\n".join(
             f"- {d.name} (weight {d.weight}, pass when score >= {d.pass_threshold}, scale {d.scale}): {d.description}"
             for d in rubric.dimensions

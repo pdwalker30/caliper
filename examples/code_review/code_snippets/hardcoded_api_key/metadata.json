@@ -1,7 +1,6 @@
 {
   "eval_type": "code_review",
   "description": "Hardcoded production payment-processor secret committed to source code. Severity: Critical. If this file is checked into a public repo (or even a private one accessible to non-payments engineers), the key is compromised and must be rotated.",
-  "rubric": "standard-code-review",
   "expected": {
     "vulnerability_kind": "hardcoded_secret",
     "true_severity": "critical",

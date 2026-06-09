@@ -1,7 +1,6 @@
 {
   "eval_type": "code_review",
   "description": "Classic SQL injection in a user-lookup function. The username parameter is concatenated directly into the SQL query string. Severity: High. Remediation: use parameterized queries with placeholders.",
-  "rubric": "standard-code-review",
   "expected": {
     "vulnerability_kind": "sql_injection",
     "true_severity": "high",

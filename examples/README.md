@@ -93,11 +93,18 @@ load time so typos surface immediately.
 Key models:
 
 - `TestCaseMetadata` — what goes in `code_snippets/<id>/metadata.json`
+  (eval_type, expected, description, tags — NO rubric reference)
 - `PromptMetadata` — what goes in `prompts/<id>/metadata.json`
 - `JudgePromptMetadata` — what goes in `judge_prompts/<id>/metadata.json`
-- `Rubric` + `RubricDimension` — the rubric block inside `TestCaseMetadata`
-- `EvalConfig` — the top-level `eval_config.yaml` shape (with `RetryConfig`,
-  `HumanReviewConfig`)
+- `Rubric` + `RubricDimension` — defined once in `rubrics/<name>/rubric.json`
+- `EvalConfig` — the top-level `eval_config.yaml` shape. Owns rubric
+  assignment via `default_rubric` and (optional) `rubric_by_eval_type`.
+
+**Rubric assignment lives entirely in EvalConfig, not on test cases.** Test
+cases declare their `eval_type` (a discriminator like `code_review` or
+`agent_tool_call`); EvalConfig maps eval_types to rubrics. This keeps test
+data fully independent of scoring logic — the same test cases can be
+scored by different rubrics in different campaigns without editing files.
 
 ## Forking this sample for your own evals
 

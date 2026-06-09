@@ -1,7 +1,6 @@
 {
   "eval_type": "code_review",
   "description": "Missing authentication AND authorization checks on a destructive action. Anyone can hit DELETE /delete?user_id=X and remove an arbitrary user account. There's no verification that the caller is authenticated, and no check that the caller is permitted to delete the target user. Severity: Critical (broken access control, OWASP A01).",
-  "rubric": "standard-code-review",
   "expected": {
     "vulnerability_kind": "broken_access_control",
     "true_severity": "critical",

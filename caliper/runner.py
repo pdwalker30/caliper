@@ -34,7 +34,7 @@ from caliper.dataset_bootstrap import (
     bootstrap_dataset,
     load_rubrics,
     load_test_cases,
-    resolve_rubrics_in_cases,
+    resolve_rubric_for_eval_type,
 )
 from caliper.human_review import (
     LangfuseAnnotationClient,
@@ -48,6 +48,7 @@ from caliper.schemas import (
     HumanReviewConfig,
     JudgePromptMetadata,
     PromptMetadata,
+    Rubric,
     TestCaseMetadata,
 )
 
@@ -196,16 +197,29 @@ def run_eval(
     langfuse = Langfuse()
     client = LiteLLMProxyClient(retry_config=config.retry)
 
+    # Load rubrics + validate every test case's eval_type resolves cleanly.
+    # Failing fast here beats failing on the first cell that hits a missing
+    # rubric mapping mid-pass.
+    rubrics = load_rubrics(rubrics_dir)
+    raw_cases = load_test_cases(test_cases_dir)
+    case_rubrics: dict[str, Rubric] = {}
+    for case_id, _, meta in raw_cases:
+        case_rubrics[case_id] = resolve_rubric_for_eval_type(
+            meta.eval_type,
+            rubrics,
+            config.default_rubric,
+            config.rubric_by_eval_type,
+        )
+
     print(f"[caliper] bootstrapping dataset {config.dataset_name!r} from {test_cases_dir}")
     n_items = bootstrap_dataset(
         langfuse=langfuse,
         dataset_name=config.dataset_name,
         test_cases_dir=test_cases_dir,
-        rubrics_dir=rubrics_dir,
-        default_rubric_name=config.default_rubric,
         description=f"Caliper eval campaign: {config.name}",
     )
     print(f"[caliper] dataset has {n_items} item(s)")
+    print(f"[caliper] resolved rubric for {len(case_rubrics)} test case(s)")
 
     prompts = load_prompts(prompts_dir)
     judge_prompt_text, judge_prompt_meta = load_judge_prompt(
@@ -229,8 +243,7 @@ def run_eval(
 
     annotation_client, queue_id = _maybe_setup_human_review(
         config=config,
-        test_cases_dir=test_cases_dir,
-        rubrics_dir=rubrics_dir,
+        case_rubrics=case_rubrics,
     )
 
     # Hash-based idempotency: fetch existing cell hashes for this campaign upfront.
@@ -251,6 +264,7 @@ def run_eval(
         config=config,
         prompts=prompts,
         dataset_items=dataset_items,
+        case_rubrics=case_rubrics,
         judge_prompt_text=judge_prompt_text,
         timestamp=timestamp,
         existing_hashes=existing_hashes,
@@ -328,6 +342,7 @@ def _build_submissions(
     config: EvalConfig,
     prompts: list[tuple[str, str, PromptMetadata]],
     dataset_items: list,
+    case_rubrics: dict[str, Rubric],
     judge_prompt_text: str,
     timestamp: str,
     existing_hashes: set[str],
@@ -356,6 +371,10 @@ def _build_submissions(
 
         for item in dataset_items:
             test_case_meta = TestCaseMetadata.model_validate(item.metadata)
+            # The resolved rubric for this test case (looked up by eval_type
+            # at run_eval time). Test cases no longer carry their own rubric;
+            # the eval_config owns the assignment.
+            rubric = case_rubrics[item.id]
 
             for iteration in range(config.iterations):
                 cell_hash = compute_cell_hash(
@@ -366,7 +385,7 @@ def _build_submissions(
                     judge_model=config.judge_model,
                     snippet_content=item.input["content"],
                     expected=test_case_meta.expected,
-                    rubric=test_case_meta.rubric.model_dump(),
+                    rubric=rubric.model_dump(),
                     iteration=iteration,
                 )
 
@@ -384,6 +403,7 @@ def _build_submissions(
                         "iteration": iteration,
                         "item": item,
                         "test_case_meta": test_case_meta,
+                        "rubric": rubric,
                         "cell_hash": cell_hash,
                         "should_sample": False,  # filled in below
                     }
@@ -497,12 +517,7 @@ def _run_one_wrapped(
     annotation_client: LangfuseAnnotationClient | None,
     queue_id: str | None,
 ) -> dict:
-    """Run one cell inside a worker thread. Never raises — wraps the result.
-
-    Per-cell isolation: an exception from _run_one becomes a dict result that
-    the main thread aggregates into the failed list. The thread pool keeps
-    running other cells regardless.
-    """
+    """Run one cell inside a worker thread. Never raises — wraps the result."""
     try:
         _run_one(
             item=sub["item"],
@@ -513,6 +528,7 @@ def _run_one_wrapped(
             model=sub["model"],
             iteration=sub["iteration"],
             test_case_meta=sub["test_case_meta"],
+            rubric=sub["rubric"],
             client=client,
             judge=judge,
             config=config,
@@ -566,8 +582,7 @@ def _maybe_fetch_existing_hashes(*, config: EvalConfig, force: bool) -> set[str]
 def _maybe_setup_human_review(
     *,
     config: EvalConfig,
-    test_cases_dir: Path,
-    rubrics_dir: Path,
+    case_rubrics: dict[str, Rubric],
 ) -> tuple[LangfuseAnnotationClient | None, str | None]:
     """Set up human-review queue + score configs if configured.
 
@@ -583,21 +598,17 @@ def _maybe_setup_human_review(
         print(f"[caliper] WARN: human review setup skipped — {e}", file=sys.stderr)
         return None, None
 
-    try:
-        rubrics = load_rubrics(rubrics_dir)
-        cases = load_test_cases(test_cases_dir)
-        cases = resolve_rubrics_in_cases(cases, rubrics, config.default_rubric)
-        # POC assumption: all test cases in this pass share rubric dim names,
-        # so the first one is representative for ScoreConfig derivation.
-        rubric = cases[0][2].rubric
-    except Exception as e:
+    if not case_rubrics:
         print(
-            f"[caliper] WARN: could not derive rubric for queue setup ({e}); "
-            f"enqueueing disabled for this pass",
+            "[caliper] WARN: no resolved rubrics; enqueueing disabled",
             file=sys.stderr,
         )
         client.close()
         return None, None
+
+    # POC assumption: all test cases in this pass share rubric dim names,
+    # so the first one is representative for ScoreConfig derivation.
+    rubric = next(iter(case_rubrics.values()))
 
     queue_id: str | None = None
     if config.human_review.auto_create:
@@ -649,6 +660,7 @@ def _run_one(
     model: str,
     iteration: int,
     test_case_meta: TestCaseMetadata,
+    rubric: Rubric,
     client: LiteLLMProxyClient,
     judge: RubricJudge,
     config: EvalConfig,
@@ -741,6 +753,7 @@ def _run_one(
                 verdict = judge.evaluate(
                     test_case_input=test_case_text,
                     test_case_metadata=test_case_meta,
+                    rubric=rubric,
                     llm_output=result.output,
                     mode=mode,
                 )
