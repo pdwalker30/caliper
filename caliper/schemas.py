@@ -71,7 +71,12 @@ class TestCaseMetadata(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     eval_type: str
-    expected: dict[str, Any] = Field(default_factory=dict)
+    # Any JSON-serializable shape — dict, list, str, number, bool, null.
+    # Caliper never accesses specific keys on `expected`; it just serializes
+    # the whole thing into the judge prompt via `{expected_json}`. So the
+    # shape is fully domain-specific — list of vulnerabilities, dict of
+    # required tool calls, single string, whatever fits your test cases.
+    expected: Any = Field(default_factory=dict)
     description: str = ""
     tags: list[str] = Field(default_factory=list)
 

@@ -147,6 +147,63 @@ def probe_eval_config_paths(config_path: Path) -> list[CheckResult]:
             results.append(CheckResult(f"{label} exists", "PASS", str(path)))
         else:
             results.append(CheckResult(f"{label} exists", "FAIL", f"missing: {path}"))
+
+    # Validate every test case's metadata.json against TestCaseMetadata AND
+    # resolve its rubric — unconditional, not gated by human_review. This
+    # catches malformed metadata (typos in field names, wrong shapes) BEFORE
+    # any LLM call fires.
+    from caliper.dataset_bootstrap import (
+        load_rubrics,
+        load_test_cases,
+        resolve_rubric_for_eval_type,
+    )
+
+    try:
+        test_cases_dir = (cfg_dir / config.test_cases_dir).resolve()
+        rubrics_dir = (cfg_dir / config.rubrics_dir).resolve()
+        cases = load_test_cases(test_cases_dir)
+        results.append(
+            CheckResult(
+                "Test cases parse",
+                "PASS",
+                f"{len(cases)} test case(s) validated against TestCaseMetadata",
+            )
+        )
+        try:
+            rubrics = load_rubrics(rubrics_dir)
+            unresolved: list[str] = []
+            for case_id, _, meta in cases:
+                try:
+                    resolve_rubric_for_eval_type(
+                        meta.eval_type,
+                        rubrics,
+                        config.default_rubric,
+                        config.rubric_by_eval_type,
+                    )
+                except Exception as exc:
+                    unresolved.append(f"{case_id} -> {exc}")
+            if unresolved:
+                results.append(
+                    CheckResult(
+                        "Rubric resolution",
+                        "FAIL",
+                        f"{len(unresolved)} test case(s) cannot resolve a rubric: "
+                        + "; ".join(unresolved[:3]),
+                    )
+                )
+            else:
+                results.append(
+                    CheckResult(
+                        "Rubric resolution",
+                        "PASS",
+                        f"every test case's eval_type resolves to a rubric in {rubrics_dir.name}/",
+                    )
+                )
+        except Exception as e:
+            results.append(CheckResult("Rubric resolution", "FAIL", str(e)))
+    except Exception as e:
+        results.append(CheckResult("Test cases parse", "FAIL", str(e)))
+
     return results
 
 
