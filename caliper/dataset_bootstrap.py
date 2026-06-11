@@ -18,11 +18,9 @@ than creating duplicates.
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
-from langfuse import Langfuse
-
+from caliper.human_review import LangfuseAnnotationClient
 from caliper.schemas import Rubric, TestCaseMetadata
 
 
@@ -150,7 +148,7 @@ def load_test_cases(
 
 
 def bootstrap_dataset(
-    langfuse: Langfuse,
+    client: LangfuseAnnotationClient,
     dataset_name: str,
     test_cases_dir: Path,
     description: str = "",
@@ -161,17 +159,20 @@ def bootstrap_dataset(
     eval_config land and are resolved per cell by the runner based on each
     test case's eval_type.
 
-    Idempotent: Langfuse's create_dataset / create_dataset_item APIs are upsert-
-    on-name and upsert-on-id respectively. Re-running with the same inputs
-    produces no duplicates.
+    Idempotent: the Langfuse REST endpoints `POST /api/public/datasets` and
+    `POST /api/public/dataset-items` upsert on name and on id respectively, so
+    re-running with the same inputs produces no duplicates. We go straight to
+    REST (rather than the SDK's create_dataset / create_dataset_item) to match
+    the rest of Caliper's Langfuse management calls and to stay clear of SDK
+    version drift on the dataset-item upsert path.
     """
-    langfuse.create_dataset(name=dataset_name, description=description)
+    client.ensure_dataset(name=dataset_name, description=description)
 
     cases = load_test_cases(test_cases_dir)
     for case_id, content, metadata in cases:
-        langfuse.create_dataset_item(
+        client.upsert_dataset_item(
             dataset_name=dataset_name,
-            id=case_id,
+            item_id=case_id,
             input={"content": content},
             metadata=metadata.model_dump(),
         )

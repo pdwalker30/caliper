@@ -250,6 +250,53 @@ class LangfuseAnnotationClient:
         )
         return resp.json()
 
+    # --- Datasets ----------------------------------------------------------
+
+    def ensure_dataset(self, name: str, description: str = "") -> dict[str, Any]:
+        """Create-or-upsert a dataset by name.
+
+        `POST /api/public/datasets` is upsert-on-name: re-running with the same
+        name updates in place rather than erroring or duplicating. This replaces
+        the SDK's `create_dataset`, which is the management surface most exposed
+        to SDK-version drift.
+        """
+        body: dict[str, Any] = {"name": name}
+        if description:
+            body["description"] = description
+        resp = self._client.post("/api/public/datasets", json=body)
+        self._raise_with_context(resp, f"ensure_dataset({name!r})")
+        return resp.json()
+
+    def upsert_dataset_item(
+        self,
+        dataset_name: str,
+        item_id: str,
+        input: Any,
+        metadata: Any | None = None,
+        expected_output: Any | None = None,
+    ) -> dict[str, Any]:
+        """Create-or-update one dataset item, keyed on `item_id`.
+
+        `POST /api/public/dataset-items` upserts on `id` — passing the test-case
+        folder name as the id makes re-runs idempotent (update in place) instead
+        of erroring or producing duplicates. This is the documented REST
+        behavior the SDK's `create_dataset_item` was supposed to wrap.
+        """
+        body: dict[str, Any] = {
+            "datasetName": dataset_name,
+            "id": item_id,
+            "input": input,
+        }
+        if metadata is not None:
+            body["metadata"] = metadata
+        if expected_output is not None:
+            body["expectedOutput"] = expected_output
+        resp = self._client.post("/api/public/dataset-items", json=body)
+        self._raise_with_context(
+            resp, f"upsert_dataset_item({dataset_name!r}/{item_id!r})"
+        )
+        return resp.json()
+
     # --- Helpers -----------------------------------------------------------
 
     def _raise_with_context(self, resp: httpx.Response, operation: str) -> None:

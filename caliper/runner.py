@@ -25,6 +25,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 from itertools import product
 from pathlib import Path
+from typing import Any
 
 import yaml
 from dotenv import load_dotenv
@@ -212,12 +213,19 @@ def run_eval(
         )
 
     print(f"[caliper] bootstrapping dataset {config.dataset_name!r} from {test_cases_dir}")
-    n_items = bootstrap_dataset(
-        langfuse=langfuse,
-        dataset_name=config.dataset_name,
-        test_cases_dir=test_cases_dir,
-        description=f"Caliper eval campaign: {config.name}",
-    )
+    # Dataset create + item upsert go through the raw REST client (not the SDK)
+    # to match Caliper's other Langfuse management calls and avoid SDK drift on
+    # the dataset-item upsert path. Live trace ingestion below stays on the SDK.
+    lf_rest = LangfuseAnnotationClient.from_env()
+    try:
+        n_items = bootstrap_dataset(
+            client=lf_rest,
+            dataset_name=config.dataset_name,
+            test_cases_dir=test_cases_dir,
+            description=f"Caliper eval campaign: {config.name}",
+        )
+    finally:
+        lf_rest.close()
     print(f"[caliper] dataset has {n_items} item(s)")
     print(f"[caliper] resolved rubric for {len(case_rubrics)} test case(s)")
 
@@ -357,7 +365,10 @@ def _build_submissions(
     by_run: dict[str, list[dict]] = {}
 
     for (prompt_id, prompt_text, prompt_meta), model in product(prompts, config.models):
-        run_name = f"{config.name}__{prompt_id}__{model}__{timestamp}"
+        # Lead with the two comparison axes (prompt, then model) so the Dataset
+        # Runs list sorts/scans by what you're actually comparing; campaign +
+        # timestamp trail behind purely to keep the run name unique per cycle.
+        run_name = f"{prompt_id}__{model}__{config.name}__{timestamp}"
         run_metadata = {
             "campaign": config.name,
             "prompt_id": prompt_id,
@@ -675,8 +686,13 @@ def _run_one(
     Langfuse Dataset Run (run_name). All child observations + scores nest under
     that parent.
     """
-    test_case_text = item.input["content"]
-    rendered_prompt = prompt_text.replace("{test_case}", test_case_text)
+    test_case_text = item.input["content"]    
+    #rendered_prompt = prompt_text.replace("{test_case}", test_case_text)
+
+    if "{test_case}" in prompt_text:
+        rendered_prompt = prompt_text.replace("{test_case}", test_case_text)
+    else:
+        rendered_prompt = f"{prompt_text}\n\nTest case:\n{test_case_text}"
 
     with item.run(
         run_name=run_name,
