@@ -165,15 +165,29 @@ def bootstrap_dataset(
     REST (rather than the SDK's create_dataset / create_dataset_item) to match
     the rest of Caliper's Langfuse management calls and to stay clear of SDK
     version drift on the dataset-item upsert path.
+
+    Item-id namespacing: Langfuse dataset-item ids are unique per *project*, not
+    per dataset. A bare folder name (e.g. `regex_issue`) therefore collides the
+    moment the same test case appears in two datasets in one project — Langfuse
+    rejects the second create ("already exists in a dataset other than ...",
+    surfaced as a misleading "not found" on older builds). We dodge that by
+    namespacing the stored id as `<dataset_name>::<folder>` and keeping the bare
+    folder name as the user-facing `test_case_key` in metadata. Downstream code
+    keys off `test_case_key` (see runner._test_case_key), so tags, the
+    `test_case_ids` allowlist, and the UI all stay clean folder names.
     """
     client.ensure_dataset(name=dataset_name, description=description)
 
     cases = load_test_cases(test_cases_dir)
     for case_id, content, metadata in cases:
+        meta = metadata.model_dump()
+        # Bare folder name kept as the stable, user-facing key; the Langfuse id
+        # itself is namespaced below to stay project-unique across datasets.
+        meta["test_case_key"] = case_id
         client.upsert_dataset_item(
             dataset_name=dataset_name,
-            item_id=case_id,
+            item_id=f"{dataset_name}::{case_id}",
             input={"content": content},
-            metadata=metadata.model_dump(),
+            metadata=meta,
         )
     return len(cases)

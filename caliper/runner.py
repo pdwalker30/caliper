@@ -93,12 +93,55 @@ def _filter_prompts(
     return filtered
 
 
+def _test_case_key(item) -> str:
+    """The user-facing test-case key (the on-disk folder name).
+
+    Bootstrap namespaces the Langfuse item id as `<dataset>::<folder>` because
+    Langfuse dataset-item ids are unique per *project*, not per dataset — a bare
+    folder name collides across datasets. The bare folder name is stashed in
+    item metadata as `test_case_key`; everything user-facing (tags, the
+    `test_case_ids` allowlist, logs) keys off that, never the namespaced id.
+    Falls back to `item.id` for items created before this scheme existed.
+    """
+    md = getattr(item, "metadata", None)
+    if isinstance(md, dict):
+        key = md.get("test_case_key")
+        if key:
+            return str(key)
+    return item.id
+
+
+def _dedupe_items_by_key(items: list) -> list:
+    """Collapse items that share a test_case_key.
+
+    A dataset can end up with both a bare-id item and a namespaced one for the
+    same test case if it was partially populated before the id-namespacing
+    change. Keep the namespaced item (id != bare key) and warn, so a mixed-scheme
+    dataset doesn't silently double every Cartesian cell.
+    """
+    by_key: dict[str, object] = {}
+    for it in items:
+        key = _test_case_key(it)
+        prev = by_key.get(key)
+        if prev is None:
+            by_key[key] = it
+            continue
+        keep = it if it.id != key else prev
+        print(
+            f"[caliper] WARN: duplicate dataset items for test case {key!r} "
+            f"(ids: {prev.id!r}, {it.id!r}); using {keep.id!r}",
+            file=sys.stderr,
+        )
+        by_key[key] = keep
+    return list(by_key.values())
+
+
 def _filter_dataset_items(items: list, allow_ids: list[str]) -> list:
-    """Subset Langfuse dataset items by id allowlist. Empty = no filter."""
+    """Subset Langfuse dataset items by test-case-key allowlist. Empty = no filter."""
     if not allow_ids:
         return items
     selected = set(allow_ids)
-    available = {i.id for i in items}
+    available = {_test_case_key(i) for i in items}
     missing = selected - available
     if missing:
         print(
@@ -106,7 +149,7 @@ def _filter_dataset_items(items: list, allow_ids: list[str]) -> list:
             f"{sorted(missing)} (available: {sorted(available)})",
             file=sys.stderr,
         )
-    filtered = [i for i in items if i.id in selected]
+    filtered = [i for i in items if _test_case_key(i) in selected]
     print(
         f"[caliper] test_case_ids filter: {len(filtered)} of {len(items)} "
         f"test case(s) selected"
@@ -247,7 +290,9 @@ def run_eval(
     # itself still contains every test case (idempotent bootstrap), so toggling
     # subsets doesn't churn the persistent Langfuse state.
     prompts = _filter_prompts(prompts, config.prompt_ids)
-    dataset_items = _filter_dataset_items(list(dataset.items), config.test_case_ids)
+    dataset_items = _filter_dataset_items(
+        _dedupe_items_by_key(list(dataset.items)), config.test_case_ids
+    )
 
     annotation_client, queue_id = _maybe_setup_human_review(
         config=config,
@@ -313,14 +358,14 @@ def run_eval(
                     ran += 1
                     print(
                         f"[caliper] {i}/{len(submissions)}  OK    "
-                        f"{sub['run_name']} / {sub['item'].id} / iter={sub['iteration'] + 1}  "
+                        f"{sub['run_name']} / {_test_case_key(sub['item'])} / iter={sub['iteration'] + 1}  "
                         f"hash={sub['cell_hash'][:8]}"
                     )
                 else:
                     failed.append(
                         (
                             sub["run_name"],
-                            sub["item"].id,
+                            _test_case_key(sub["item"]),
                             sub["model"],
                             sub["iteration"],
                             result["error"],
@@ -328,7 +373,7 @@ def run_eval(
                     )
                     print(
                         f"[caliper] {i}/{len(submissions)}  FAIL  "
-                        f"{sub['run_name']} / {sub['item'].id} / iter={sub['iteration'] + 1}  "
+                        f"{sub['run_name']} / {_test_case_key(sub['item'])} / iter={sub['iteration'] + 1}  "
                         f"{result['exc_type']}: {result['error'][:160]}",
                         file=sys.stderr,
                     )
@@ -384,8 +429,10 @@ def _build_submissions(
             test_case_meta = TestCaseMetadata.model_validate(item.metadata)
             # The resolved rubric for this test case (looked up by eval_type
             # at run_eval time). Test cases no longer carry their own rubric;
-            # the eval_config owns the assignment.
-            rubric = case_rubrics[item.id]
+            # the eval_config owns the assignment. case_rubrics is keyed by the
+            # bare folder name, so resolve via the test-case key (item.id is the
+            # dataset-namespaced id, which would miss).
+            rubric = case_rubrics[_test_case_key(item)]
 
             for iteration in range(config.iterations):
                 cell_hash = compute_cell_hash(
@@ -705,10 +752,12 @@ def _run_one(
         # code-review use case (agent eval inputs, customer-service queries,
         # etc.). The `code_snippet:` tag was a domain leak from the original
         # sample; this is the corrected generic shape.
+        # User-facing key = bare folder name (item.id is namespaced by dataset).
+        tc_key = _test_case_key(item)
         tags = [
             f"prompt:{prompt_id}",
             f"model:{model}",
-            f"test_case:{item.id}",
+            f"test_case:{tc_key}",
             f"iteration:{iteration}",
             f"eval_type:{test_case_meta.eval_type}",
             f"campaign:{config.name}",
@@ -716,7 +765,7 @@ def _run_one(
         metadata: dict[str, object] = {
             "prompt_id": prompt_id,
             "model": model,
-            "test_case": item.id,
+            "test_case": tc_key,
             "iteration": iteration,
             "eval_type": test_case_meta.eval_type,
             "campaign": config.name,
