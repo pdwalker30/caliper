@@ -147,8 +147,14 @@ class LangfuseAnnotationClient:
         return out
 
     def find_score_config(self, name: str) -> dict[str, Any] | None:
+        """Return the first ACTIVE config with this name, or None.
+
+        The list endpoint returns archived configs too (and names aren't unique
+        in Langfuse), so an archived leftover must be skipped — reusing one would
+        silently bind the wrong scale.
+        """
         for cfg in self.list_score_configs():
-            if cfg.get("name") == name:
+            if cfg.get("name") == name and not cfg.get("isArchived", False):
                 return cfg
         return None
 
@@ -171,30 +177,38 @@ class LangfuseAnnotationClient:
         return resp.json()
 
     def ensure_score_config(self, spec: ScoreConfigSpec) -> str:
-        """Find-or-create by name; returns the config's id.
+        """Find-or-create; returns the config's id.
 
-        Langfuse score configs are immutable once created and matched by name, so
-        a config left over from an earlier scale (e.g. a 0-1 `finds_bug` from
-        before the 1-5 migration) is reused as-is. That would silently put a 0-1
-        slider in front of the annotator while calibration treats the value as
-        1-5 — so warn loudly on a range mismatch rather than reconcile it.
+        Reuses only an ACTIVE config that matches name, dataType AND (for numeric)
+        the min/max range. Langfuse configs are immutable, names aren't unique,
+        and the list endpoint returns archived ones — so a leftover 0-1 config
+        from before the 1-5 migration is left untouched and a fresh 1-5 config is
+        created alongside it. The old one just sits there, archived or not, unused
+        (archive it in Settings -> Score Configs to keep that list tidy).
         """
-        existing = self.find_score_config(spec.name)
-        if existing:
+        mismatch: dict[str, Any] | None = None
+        for cfg in self.list_score_configs():
+            if cfg.get("isArchived", False) or cfg.get("name") != spec.name:
+                continue
+            if cfg.get("dataType") != spec.data_type:
+                continue
             if spec.data_type == "NUMERIC" and (
-                existing.get("minValue") != spec.min_value
-                or existing.get("maxValue") != spec.max_value
+                cfg.get("minValue") != spec.min_value
+                or cfg.get("maxValue") != spec.max_value
             ):
-                print(
-                    f"[caliper] WARN: score config {spec.name!r} already exists with "
-                    f"range [{existing.get('minValue')}, {existing.get('maxValue')}] "
-                    f"but this rubric expects [{spec.min_value}, {spec.max_value}]. "
-                    f"Langfuse won't update it — delete the old config in the UI "
-                    f"(Settings -> Score Configs) and re-run, or use a fresh project, "
-                    f"so annotators score on the right scale.",
-                    file=sys.stderr,
-                )
-            return existing["id"]
+                mismatch = cfg
+                continue
+            return cfg["id"]  # exact match — reuse it
+
+        if mismatch is not None:
+            print(
+                f"[caliper] NOTE: an active score config {spec.name!r} exists on a "
+                f"different scale [{mismatch.get('minValue')}, {mismatch.get('maxValue')}]; "
+                f"creating a new one at [{spec.min_value}, {spec.max_value}]. "
+                f"Archive the old one in Settings -> Score Configs to avoid two "
+                f"same-named configs.",
+                file=sys.stderr,
+            )
         created = self.create_score_config(spec)
         return created["id"]
 
