@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from caliper.human_review import LangfuseAnnotationClient
-
+from caliper.schemas import Rubric, aggregate_scores
 
 # ---------------------------------------------------------------------------
 # Score fetching
@@ -128,6 +128,77 @@ def build_score_pairs(
     for pair in pairs.values():
         by_name[pair.name].append(pair)
     return by_name
+
+
+def derive_pass_and_overall(
+    by_name: dict[str, list[ScorePair]],
+    rubric: Rubric,
+) -> None:
+    """Reconstruct pass flags + overall from the per-dimension numeric scores.
+
+    Caliper writes NUMERIC scores only — no boolean `__pass` columns and no
+    human-entered `overall`. This rebuilds, for BOTH the judge (llm) and human
+    sides, the data calibration reports on:
+
+      - `<dim>__pass`   : score >= dim.pass_threshold
+      - `overall`       : aggregate of the dimension scores (the judge's is also
+                          emitted; only filled here if absent / for the human)
+      - `overall__pass` : overall >= rubric.overall_pass_threshold
+
+    Both sides derive identically, so they stay directly comparable. Mutates
+    `by_name` in place; derived values land on the same ScorePair per
+    (name, trace) so the two sides pair up.
+    """
+    dim_names = [d.name for d in rubric.dimensions]
+    thresholds = {d.name: d.pass_threshold for d in rubric.dimensions}
+
+    llm_dims: dict[str, dict[str, float]] = defaultdict(dict)
+    human_dims: dict[str, dict[str, float]] = defaultdict(dict)
+    for dim_name in dim_names:
+        for p in by_name.get(dim_name, []):
+            if p.llm_value is not None:
+                llm_dims[p.trace_id][dim_name] = p.llm_value
+            if p.human_value is not None:
+                human_dims[p.trace_id][dim_name] = p.human_value
+
+    def _pair(name: str, trace_id: str) -> ScorePair:
+        for p in by_name.setdefault(name, []):
+            if p.trace_id == trace_id:
+                return p
+        pair = ScorePair(trace_id=trace_id, name=name)
+        by_name[name].append(pair)
+        return pair
+
+    thr = rubric.overall_pass_threshold
+    for trace_id in set(llm_dims) | set(human_dims):
+        ld = llm_dims.get(trace_id, {})
+        hd = human_dims.get(trace_id, {})
+
+        for dim_name in dim_names:
+            pp = _pair(f"{dim_name}__pass", trace_id)
+            if dim_name in ld:
+                pp.llm_value = float(ld[dim_name] >= thresholds[dim_name])
+            if dim_name in hd:
+                pp.human_value = float(hd[dim_name] >= thresholds[dim_name])
+
+        overall_pair = _pair("overall", trace_id)
+        overall_pass_pair = _pair("overall__pass", trace_id)
+
+        # Judge overall numeric is emitted; prefer it, else aggregate when the
+        # judge scored every dimension. Derive the pass flag from whichever.
+        llm_overall = overall_pair.llm_value
+        if llm_overall is None and all(d in ld for d in dim_names):
+            llm_overall = aggregate_scores(rubric, ld)
+            overall_pair.llm_value = llm_overall
+        if llm_overall is not None:
+            overall_pass_pair.llm_value = float(llm_overall >= thr)
+
+        # Human overall is always derived (humans enter only dimension scores),
+        # and only when they scored EVERY dimension so it's comparable.
+        if all(d in hd for d in dim_names):
+            human_overall = aggregate_scores(rubric, hd)
+            overall_pair.human_value = human_overall
+            overall_pass_pair.human_value = float(human_overall >= thr)
 
 
 def _coerce_score_value(value: Any, data_type: str | None) -> float | None:

@@ -813,7 +813,6 @@ def _run_one(
             with parent.start_as_current_generation(
                 name=gen_name,
                 model=_langfuse_model(config.judge_model, config.langfuse_model_mapping),
-                input=[{"role": "system", "content": f"Caliper rubric judge ({mode})"}],
             ) as judge_gen:
                 verdict = judge.evaluate(
                     test_case_input=test_case_text,
@@ -822,8 +821,11 @@ def _run_one(
                     llm_output=result.output,
                     mode=mode,
                 )
+                # Stamp the actual rendered judge prompt as the generation input so
+                # a human annotator can see exactly what the judge was asked.
                 judge_gen.update(
-                    output=verdict.model_dump(exclude={"raw_response"}),
+                    input=[{"role": "user", "content": verdict.rendered_prompt}],
+                    output=verdict.model_dump(exclude={"raw_response", "rendered_prompt"}),
                 )
             verdicts_by_mode[mode] = verdict
 
@@ -837,33 +839,40 @@ def _run_one(
         parent.update(
             output={
                 "generated": result.output,
-                "verdict": primary_verdict.model_dump(exclude={"raw_response"}),
+                "verdict": primary_verdict.model_dump(
+                    exclude={"raw_response", "rendered_prompt"}
+                ),
                 "verdict_modes": list(verdicts_by_mode.keys()),
             },
         )
 
         # ----- 3. Scores -----
-        # Anchored mode emits unsuffixed names (backward compat). Other modes
-        # emit `<dim>__<mode>` and `<dim>__pass__<mode>`. So `finds_bug` is
-        # the anchored score; `finds_bug__blind` is the blind variant.
-        for mode, verdict in verdicts_by_mode.items():
-            suffix = "" if mode == "anchored" else f"__{mode}"
-            for dim_name, dim_score in verdict.dimensions.items():
+        # Emit NUMERIC scores only. Pass/fail is DERIVED at calibration time
+        # from the numeric score + the rubric threshold (see
+        # caliper.calibration.derive_pass_and_overall) — emitting boolean
+        # `__pass` columns too would just double the columns in the Langfuse
+        # comparison view for no added information.
+        #
+        # Anchored mode emits unsuffixed names; other modes append `__<mode>`
+        # (e.g. `finds_bug` vs `finds_bug__blind`). Variants of one dimension
+        # are emitted consecutively so they stay adjacent in Langfuse versions
+        # that order score columns by creation order (newer versions sort
+        # alphabetically, where a shared name prefix already groups them).
+        modes = list(verdicts_by_mode.keys())
+        for dim_name in primary_verdict.dimensions:
+            for mode in modes:
+                suffix = "" if mode == "anchored" else f"__{mode}"
+                dim_score = verdicts_by_mode[mode].dimensions[dim_name]
                 parent.score_trace(
                     name=f"{dim_name}{suffix}",
                     value=dim_score.value,
                     comment=dim_score.reasoning[:1000],
                 )
-                parent.score_trace(
-                    name=f"{dim_name}__pass{suffix}",
-                    value=1 if dim_score.passed else 0,
-                    data_type="BOOLEAN",
-                )
-            parent.score_trace(name=f"overall{suffix}", value=verdict.overall_value)
+        for mode in modes:
+            suffix = "" if mode == "anchored" else f"__{mode}"
             parent.score_trace(
-                name=f"overall__pass{suffix}",
-                value=1 if verdict.overall_passed else 0,
-                data_type="BOOLEAN",
+                name=f"overall{suffix}",
+                value=verdicts_by_mode[mode].overall_value,
             )
 
         # ----- 4. Optional: enqueue for human review -----

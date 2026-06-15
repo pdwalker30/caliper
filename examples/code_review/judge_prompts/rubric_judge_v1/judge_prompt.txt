@@ -21,7 +21,7 @@ EXPECTED REFERENCE (ground truth — what a perfect review would identify):
 {expected_json}
 
 ==========================================================================
-RUBRIC (each dimension is scored 0.0 to 1.0):
+RUBRIC (each dimension is scored 1 to 5, integers only — 1 = worst, 5 = best):
 ==========================================================================
 {rubric_dimensions}
 
@@ -37,7 +37,7 @@ INSTRUCTIONS:
 Score each rubric dimension carefully against the EXPECTED REFERENCE above.
 For each dimension, provide:
 
-  - "score":     a float between 0.0 and 1.0
+  - "score":     an integer from 1 to 5 (1 = worst, 5 = best)
   - "reasoning": one to three sentences explaining why you gave that score
 
 Return ONLY a JSON object exactly matching the shape below. Do not include

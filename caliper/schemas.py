@@ -12,6 +12,23 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+# ---------------------------------------------------------------------------
+# Scoring scale — single source of truth
+# ---------------------------------------------------------------------------
+#
+# Caliper scores on one unified integer scale for BOTH the LLM judge and the
+# human annotator, so calibration compares like with like (no normalization).
+# Humans reliably discriminate ~5 levels; finer scales add noise to the very
+# signal calibration measures the judge against. Change these two constants to
+# move the whole framework to a different scale.
+
+SCORE_MIN = 1
+SCORE_MAX = 5
+DEFAULT_SCALE = f"{SCORE_MIN}-{SCORE_MAX}"
+# A dimension/overall "passes" at-or-above its threshold. Default sits one notch
+# below the top so a 4 or 5 passes on the 1-5 scale.
+DEFAULT_PASS_THRESHOLD = 4.0
+
 
 # ---------------------------------------------------------------------------
 # Rubric — the contract between a test case and the judge
@@ -25,9 +42,12 @@ class RubricDimension(BaseModel):
 
     name: str
     description: str
+    # Weight is a proportion for weighted_mean aggregation — independent of the
+    # score scale, so it stays 0..1.
     weight: float = Field(ge=0, le=1)
-    pass_threshold: float = Field(ge=0, le=1)
-    scale: str = "0-1"
+    # Threshold on the SCORE scale (1-5): score >= pass_threshold => passed.
+    pass_threshold: float = Field(ge=SCORE_MIN, le=SCORE_MAX, default=DEFAULT_PASS_THRESHOLD)
+    scale: str = DEFAULT_SCALE
 
 
 class Rubric(BaseModel):
@@ -45,7 +65,28 @@ class Rubric(BaseModel):
     description: str = ""
     dimensions: list[RubricDimension]
     aggregation: Literal["weighted_mean", "min", "max"] = "weighted_mean"
-    overall_pass_threshold: float = Field(ge=0, le=1, default=0.7)
+    # Threshold on the SCORE scale (1-5) applied to the aggregated overall.
+    overall_pass_threshold: float = Field(
+        ge=SCORE_MIN, le=SCORE_MAX, default=DEFAULT_PASS_THRESHOLD
+    )
+
+
+def aggregate_scores(rubric: Rubric, values: dict[str, float]) -> float:
+    """Aggregate per-dimension scores into one overall, per the rubric's policy.
+
+    Shared by the LLM judge (scoring a verdict) and calibration (deriving a
+    human overall from per-dimension human scores) so both roll up identically.
+    `values` maps dimension name -> score on the 1-5 scale.
+    """
+    if rubric.aggregation == "min":
+        return min(values[d.name] for d in rubric.dimensions)
+    if rubric.aggregation == "max":
+        return max(values[d.name] for d in rubric.dimensions)
+    # weighted_mean (the remaining aggregation policy)
+    total_weight = sum(d.weight for d in rubric.dimensions)
+    if total_weight == 0:
+        return float(SCORE_MIN)
+    return sum(values[d.name] * d.weight for d in rubric.dimensions) / total_weight
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +156,7 @@ class DimensionScore(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     name: str
-    value: float = Field(ge=0, le=1)
+    value: float = Field(ge=SCORE_MIN, le=SCORE_MAX)
     passed: bool
     reasoning: str = ""
 
@@ -126,9 +167,13 @@ class JudgeVerdict(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     dimensions: dict[str, DimensionScore]
-    overall_value: float = Field(ge=0, le=1)
+    overall_value: float = Field(ge=SCORE_MIN, le=SCORE_MAX)
     overall_passed: bool
     raw_response: str = ""
+    # The fully-substituted judge prompt that produced this verdict. Stamped
+    # onto the judge generation so a human annotator can see exactly what the
+    # judge was asked. Excluded from trace OUTPUT dumps (it's the input).
+    rendered_prompt: str = ""
 
 
 # ---------------------------------------------------------------------------

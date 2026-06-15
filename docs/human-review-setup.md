@@ -14,14 +14,15 @@ Annotation Queues. This document covers both the **automatic** setup path
    * Sampled traces (default: 2 per Run, stratified) added to the queue
                               v
 2. Humans annotate via Langfuse UI -> Annotation Queues
-   * Each queue item shows the trace + the rubric dimensions as sliders/toggles
+   * Each queue item shows the trace + a 1-5 score per rubric dimension
    * Human scores attach to the trace with source=ANNOTATION
                               v
 3. Calibration report
-   $ python -m caliper.calibration path/to/eval_config.yaml
+   $ caliper-calibrate path/to/eval_config.yaml
    * Pairs LLM scores (source=API) with human scores (source=ANNOTATION)
+   * Derives pass flags + overall (both judge and human) from the numeric scores
    * Reports MAE, Pearson r, Spearman rho per numeric dimension
-   * Reports Cohen's kappa + confusion matrix for boolean pass scores
+   * Reports Cohen's kappa + confusion matrix for the derived pass scores
 ```
 
 ## Configuration in `eval_config.yaml`
@@ -42,10 +43,10 @@ With `auto_create: true`, Caliper will:
 
 1. List existing Score Configs in the Langfuse project.
 2. For each rubric dimension in your test cases, find-or-create:
-   * `<dim_name>` (NUMERIC, range 0-1)
-   * `<dim_name>__pass` (BOOLEAN)
-3. Find-or-create the queue named in `queue_name`, binding all the score
-   configs above plus `overall` and `overall__pass`.
+   * `<dim_name>` (NUMERIC, range 1-5)
+3. Find-or-create the queue named in `queue_name`, binding those per-dimension
+   configs. **No `__pass` or `overall` configs** — the human enters only the
+   dimension scores; pass/fail and overall are derived at calibration time.
 4. Sample N traces per Dataset Run and add each to the queue.
 
 Run `python -m caliper.check_stack examples/code_review/eval_config.yaml`
@@ -59,19 +60,16 @@ UI by hand. One-time setup:
 
 ### 1. Create Score Configs (Settings -> Score Configs -> New)
 
-For each rubric dimension in your test cases, create two configs with names
-that EXACTLY MATCH the names emitted by the LLM judge (Caliper uses
-`dim.name` as the score name, and `<dim.name>__pass` for the pass flag):
+For each rubric dimension in your test cases, create ONE config whose name
+EXACTLY MATCHES the dimension name emitted by the LLM judge (Caliper uses
+`dim.name` as the score name). Do **not** create `__pass` or `overall`
+configs — those are derived, not hand-entered:
 
 | Name              | Data type  | Range / categories |
 | ----------------- | ---------- | ------------------ |
-| `finds_bug`       | NUMERIC    | min 0, max 1       |
-| `finds_bug__pass` | BOOLEAN    | (auto)             |
-| `actionability`   | NUMERIC    | min 0, max 1       |
-| `actionability__pass` | BOOLEAN | (auto)             |
-| ... one per dim   |            |                    |
-| `overall`         | NUMERIC    | min 0, max 1       |
-| `overall__pass`   | BOOLEAN    | (auto)             |
+| `finds_bug`       | NUMERIC    | min 1, max 5       |
+| `actionability`   | NUMERIC    | min 1, max 5       |
+| ... one per dim   | NUMERIC    | min 1, max 5       |
 
 ### 2. Create the Annotation Queue (Annotation Queues -> New)
 
@@ -89,8 +87,10 @@ traces.
 Going to **Annotation Queues -> \[your queue\] -> Next item**:
 
 * The trace (with the LLM's output and the judge's reasoning visible)
-* A slider per NUMERIC dimension (0.0 to 1.0)
-* A toggle per BOOLEAN dimension (pass / fail)
+* The judge's rendered prompt on the `judge` generation, so you can see exactly
+  what the judge was asked before you score
+* One 1-5 score per rubric dimension (that's all you enter — pass/fail and the
+  overall score are computed for you at calibration time)
 * Optional comment field per score
 
 Submit. Repeat. After ~15 minutes of annotation work for a small calibration
@@ -103,15 +103,20 @@ The header table looks like:
 ```
 Dimension                       N      MAE        r      rho    kappa
 ------------------------------------------------------------------------
-actionability                  12    0.087    0.872    0.853     -
+actionability                  12    0.417    0.872    0.853     -
 actionability__pass            12      -        -        -    0.667
-finds_bug                      12    0.052    0.921    0.934     -
+finds_bug                      12    0.333    0.921    0.934     -
 finds_bug__pass                12      -        -        -    0.833
-no_false_alarms                12    0.143    0.654    0.601     -    <-- weak
+no_false_alarms                12    0.667    0.654    0.601     -    <-- weak
 no_false_alarms__pass          12      -        -        -    0.412   <-- weak
-overall                        12    0.071    0.889    0.901     -
+overall                        12    0.288    0.889    0.901     -
 overall__pass                  12      -        -        -    0.750
 ```
+
+MAE is on the 1-5 score scale (~0.4 = within half a point on average). The
+`__pass` rows (and the human `overall`) are **derived** at calibration time
+from the per-dimension numeric scores — only numeric scores are written to
+Langfuse, for both the judge and the human.
 
 Then per-dimension confusion matrices for the `__pass` boolean scores:
 
@@ -123,7 +128,7 @@ Then per-dimension confusion matrices for the `__pass` boolean scores:
 
 | Metric     | "Trust the LLM judge" | "Judge prompt needs work" |
 | ---------- | --------------------- | ------------------------- |
-| MAE        | < 0.10                | > 0.15                    |
+| MAE (1-5)  | < 0.5                 | > 0.75                    |
 | Pearson r  | > 0.85                | < 0.70                    |
 | Spearman rho | > 0.85              | < 0.70                    |
 | Cohen's k  | > 0.70                | < 0.50                    |
