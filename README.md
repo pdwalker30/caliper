@@ -132,9 +132,10 @@ What happens:
 4. **Judge call.** The generic `RubricJudge` templates the judge prompt
    with the rubric metadata, calls the judge model, parses structured JSON
    back into per-dimension scores.
-5. **Scores attached.** One Score per dimension, one boolean `__pass`
-   score per dimension, plus `overall` and `overall__pass`, all on the
-   parent trace.
+5. **Scores attached.** One NUMERIC Score per dimension (integer 1-5), plus an
+   aggregated `overall`, on the parent trace. Pass/fail is **not** written as a
+   separate column — it's derived from the score + the dimension threshold at
+   calibration time, which keeps the Langfuse comparison view uncluttered.
 6. **Sample for humans.** If `human_review.enabled=true` in the config,
    the sampler picks N traces per Run and enqueues them via the Langfuse
    Annotation Queue REST API.
@@ -151,8 +152,11 @@ this phase** — it's all UI work.
 1. Open Langfuse: **http://localhost:3000**
 2. Sidebar → **Annotation Queues** → click the queue named in `eval_config.yaml`
 3. Click **Annotate Next Item** to walk through queued traces
-4. For each trace, score every rubric dimension (slider for NUMERIC, toggle
-   for BOOLEAN `__pass`) and submit
+4. For each trace, enter a **1-5 score for every rubric dimension** and submit.
+   That's the only input — pass/fail and the `overall` score are **computed
+   for you** at calibration time from those dimension scores (using the same
+   thresholds and aggregation the LLM judge uses), so there's nothing else to
+   toggle.
 5. Repeat until the queue is empty (or you've done enough for calibration —
    ~12-20 samples is plenty for a useful agreement estimate)
 
@@ -178,14 +182,19 @@ CALIPER CALIBRATION REPORT
 
 Dimension                       N      MAE        r      rho    kappa
 ------------------------------------------------------------------------
-actionability                  12    0.087    0.872    0.853     -
+actionability                  12    0.417    0.872    0.853     -
 actionability__pass            12      -        -        -    0.667
-finds_bug                      12    0.052    0.921    0.934     -
+finds_bug                      12    0.333    0.921    0.934     -
 finds_bug__pass                12      -        -        -    0.833
-overall                        12    0.071    0.889    0.901     -
+overall                        12    0.288    0.889    0.901     -
 overall__pass                  12      -        -        -    0.750
 
   Confusion for finds_bug__pass:  TP=8  FP=1  TN=2  FN=1
+
+(MAE is on the 1-5 score scale — ~0.4 means the human and judge land within
+about half a point on average. The `__pass` rows (and the human `overall`) are
+derived from the per-dimension numeric scores at calibration time — only
+numeric scores are written to Langfuse.)
 
 Guidance: r/rho > 0.85 and kappa > 0.70 = trust the LLM judge.
           Anything materially lower means the judge prompt or rubric

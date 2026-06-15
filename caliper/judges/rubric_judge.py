@@ -26,11 +26,14 @@ from typing import Any, Literal
 from caliper.judges.base import JudgeAdapter
 from caliper.litellm_client import LiteLLMProxyClient
 from caliper.schemas import (
+    SCORE_MAX,
+    SCORE_MIN,
     DimensionScore,
     JudgePromptMetadata,
     JudgeVerdict,
     Rubric,
     TestCaseMetadata,
+    aggregate_scores,
 )
 
 JudgeMode = Literal["anchored", "blind"]
@@ -81,7 +84,12 @@ class RubricJudge(JudgeAdapter):
                 f"Judge returned non-JSON response: {e}\n\nRaw:\n{result.output[:2000]}"
             ) from e
 
-        return self._parse_verdict(data, rubric, raw=result.output)
+        verdict = self._parse_verdict(data, rubric, raw=result.output)
+        # Stash the fully-substituted prompt so the runner can stamp it on the
+        # judge generation — that's what makes the judge's question visible to a
+        # human annotator opening the trace.
+        verdict.rendered_prompt = rendered
+        return verdict
 
     # ------------------------------------------------------------------ render
 
@@ -98,8 +106,11 @@ class RubricJudge(JudgeAdapter):
             for d in rubric.dimensions
         )
 
+        # Mid-scale integer in the example signals the expected shape: an integer
+        # on the configured scale, not a 0-1 float.
+        example_score = (SCORE_MIN + SCORE_MAX) // 2
         example_obj = {
-            d.name: {"score": 0.0, "reasoning": "<your reasoning>"}
+            d.name: {"score": example_score, "reasoning": "<your reasoning>"}
             for d in rubric.dimensions
         }
         response_format_example = json.dumps(example_obj, indent=2)
@@ -143,11 +154,7 @@ class RubricJudge(JudgeAdapter):
         dim_scores: dict[str, DimensionScore] = {}
         for dim in rubric.dimensions:
             entry = data.get(dim.name) or {}
-            raw_score = entry.get("score", 0.0)
-            try:
-                value = max(0.0, min(1.0, float(raw_score)))
-            except (TypeError, ValueError):
-                value = 0.0
+            value = _coerce_score(entry.get("score"))
             reasoning = str(entry.get("reasoning", ""))[:2000]
             dim_scores[dim.name] = DimensionScore(
                 name=dim.name,
@@ -156,7 +163,7 @@ class RubricJudge(JudgeAdapter):
                 reasoning=reasoning,
             )
 
-        overall = _aggregate(rubric, dim_scores)
+        overall = aggregate_scores(rubric, {n: s.value for n, s in dim_scores.items()})
         return JudgeVerdict(
             dimensions=dim_scores,
             overall_value=overall,
@@ -165,14 +172,14 @@ class RubricJudge(JudgeAdapter):
         )
 
 
-def _aggregate(rubric: Rubric, scores: dict[str, DimensionScore]) -> float:
-    if rubric.aggregation == "weighted_mean":
-        total_weight = sum(d.weight for d in rubric.dimensions)
-        if total_weight == 0:
-            return 0.0
-        return sum(scores[d.name].value * d.weight for d in rubric.dimensions) / total_weight
-    if rubric.aggregation == "min":
-        return min(scores[d.name].value for d in rubric.dimensions)
-    if rubric.aggregation == "max":
-        return max(scores[d.name].value for d in rubric.dimensions)
-    return 0.0
+def _coerce_score(raw_score: Any) -> int:
+    """Coerce a judge-returned score to an integer on the 1-5 scale.
+
+    Rounds (the judge is asked for integers but may return 4.0 or "4"), clamps
+    into range, and floors a missing/garbled score to the worst grade so a
+    malformed judge response reads as a fail, never a silent pass.
+    """
+    try:
+        return round(max(float(SCORE_MIN), min(float(SCORE_MAX), float(raw_score))))
+    except (TypeError, ValueError):
+        return SCORE_MIN

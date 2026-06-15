@@ -20,12 +20,13 @@ from __future__ import annotations
 
 import base64
 import os
+import sys
 from dataclasses import dataclass
 from typing import Any, Literal
 
 import httpx
 
-from caliper.schemas import HumanReviewConfig, Rubric
+from caliper.schemas import SCORE_MAX, SCORE_MIN, HumanReviewConfig, Rubric
 
 # ---------------------------------------------------------------------------
 # Score Config — Langfuse-native definition of "what this score means"
@@ -45,12 +46,22 @@ class ScoreConfigSpec:
 
 
 def score_configs_for_rubric(rubric: Rubric) -> list[ScoreConfigSpec]:
-    """Derive the full set of ScoreConfigSpecs implied by a rubric.
+    """Derive the human-annotation ScoreConfigSpecs implied by a rubric.
 
-    Names MUST match what eval_runner emits: each rubric dimension contributes
-    one NUMERIC config (the score) plus one BOOLEAN config (the pass flag).
-    Plus the aggregated overall pair. The names are what the human sees in
-    the annotation UI, so they need to read naturally.
+    The human enters exactly ONE number per rubric dimension: a score on the
+    1-5 scale. Everything else is derived, never hand-entered:
+
+      - pass/fail per dimension      -> score >= dim.pass_threshold
+      - overall score                -> aggregate of the dimension scores
+      - overall pass/fail            -> overall >= rubric.overall_pass_threshold
+
+    So the queue carries only the per-dimension NUMERIC configs. The boolean
+    `__pass` toggles and the `overall` field are computed at calibration time
+    (see caliper.calibration.derive_human_aggregates), which keeps the
+    annotation UI minimal and makes score/pass disagreement impossible.
+
+    Names MUST match what the eval runner emits for the LLM judge so calibration
+    can pair human and judge scores by name.
     """
     specs: list[ScoreConfigSpec] = []
     for dim in rubric.dimensions:
@@ -58,34 +69,15 @@ def score_configs_for_rubric(rubric: Rubric) -> list[ScoreConfigSpec]:
             ScoreConfigSpec(
                 name=dim.name,
                 data_type="NUMERIC",
-                description=dim.description,
-                min_value=0.0,
-                max_value=1.0,
+                description=(
+                    f"{dim.description}\n\n"
+                    f"Score {SCORE_MIN}-{SCORE_MAX} "
+                    f"(passes at >= {dim.pass_threshold:g})."
+                ),
+                min_value=float(SCORE_MIN),
+                max_value=float(SCORE_MAX),
             )
         )
-        specs.append(
-            ScoreConfigSpec(
-                name=f"{dim.name}__pass",
-                data_type="BOOLEAN",
-                description=f"Did this trace pass the {dim.name} threshold ({dim.pass_threshold})?",
-            )
-        )
-    specs.append(
-        ScoreConfigSpec(
-            name="overall",
-            data_type="NUMERIC",
-            description="Aggregated overall score across all rubric dimensions.",
-            min_value=0.0,
-            max_value=1.0,
-        )
-    )
-    specs.append(
-        ScoreConfigSpec(
-            name="overall__pass",
-            data_type="BOOLEAN",
-            description="Did this trace pass the overall threshold?",
-        )
-    )
     return specs
 
 
@@ -179,9 +171,29 @@ class LangfuseAnnotationClient:
         return resp.json()
 
     def ensure_score_config(self, spec: ScoreConfigSpec) -> str:
-        """Find-or-create; returns the config's id."""
+        """Find-or-create by name; returns the config's id.
+
+        Langfuse score configs are immutable once created and matched by name, so
+        a config left over from an earlier scale (e.g. a 0-1 `finds_bug` from
+        before the 1-5 migration) is reused as-is. That would silently put a 0-1
+        slider in front of the annotator while calibration treats the value as
+        1-5 — so warn loudly on a range mismatch rather than reconcile it.
+        """
         existing = self.find_score_config(spec.name)
         if existing:
+            if spec.data_type == "NUMERIC" and (
+                existing.get("minValue") != spec.min_value
+                or existing.get("maxValue") != spec.max_value
+            ):
+                print(
+                    f"[caliper] WARN: score config {spec.name!r} already exists with "
+                    f"range [{existing.get('minValue')}, {existing.get('maxValue')}] "
+                    f"but this rubric expects [{spec.min_value}, {spec.max_value}]. "
+                    f"Langfuse won't update it — delete the old config in the UI "
+                    f"(Settings -> Score Configs) and re-run, or use a fresh project, "
+                    f"so annotators score on the right scale.",
+                    file=sys.stderr,
+                )
             return existing["id"]
         created = self.create_score_config(spec)
         return created["id"]
