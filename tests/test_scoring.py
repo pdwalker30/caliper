@@ -13,7 +13,11 @@ from __future__ import annotations
 import pytest
 
 from caliper.calibration import ScorePair, derive_pass_and_overall
-from caliper.human_review import score_configs_for_rubric
+from caliper.human_review import (
+    LangfuseAnnotationClient,
+    ScoreConfigSpec,
+    score_configs_for_rubric,
+)
 from caliper.judges.rubric_judge import RubricJudge, _coerce_score
 from caliper.schemas import (
     SCORE_MAX,
@@ -174,3 +178,55 @@ def test_derive_judge_overall_when_not_emitted() -> None:
 
     assert by_name["overall"][0].llm_value == pytest.approx(5.0)
     assert by_name["overall__pass"][0].llm_value == 1.0   # 5 >= 4
+
+
+# --------------------------------------------------- score-config migration safety
+
+
+def _client() -> LangfuseAnnotationClient:
+    # No network until a method is called; we monkeypatch list/create below.
+    return LangfuseAnnotationClient(host="http://x", public_key="p", secret_key="s")
+
+
+def test_ensure_score_config_skips_archived_and_mismatched_scale(monkeypatch) -> None:
+    """A leftover 0-1 config (archived OR active) must NOT be reused for 1-5."""
+    c = _client()
+    existing = [
+        {"id": "arch", "name": "finds_bug", "dataType": "NUMERIC",
+         "minValue": 0.0, "maxValue": 1.0, "isArchived": True},
+        {"id": "active01", "name": "finds_bug", "dataType": "NUMERIC",
+         "minValue": 0.0, "maxValue": 1.0, "isArchived": False},
+    ]
+    monkeypatch.setattr(c, "list_score_configs", lambda: existing)
+    created: dict[str, ScoreConfigSpec] = {}
+
+    def _capture(spec: ScoreConfigSpec) -> dict[str, object]:
+        created["spec"] = spec
+        return {"id": "new15"}
+
+    monkeypatch.setattr(c, "create_score_config", _capture)
+    spec = ScoreConfigSpec(name="finds_bug", data_type="NUMERIC", min_value=1.0, max_value=5.0)
+
+    assert c.ensure_score_config(spec) == "new15"      # created fresh, not reused
+    assert created["spec"].max_value == 5.0
+    c.close()
+
+
+def test_ensure_score_config_reuses_exact_active_match(monkeypatch) -> None:
+    c = _client()
+    existing = [
+        {"id": "arch15", "name": "finds_bug", "dataType": "NUMERIC",
+         "minValue": 1.0, "maxValue": 5.0, "isArchived": True},   # archived: skip
+        {"id": "good15", "name": "finds_bug", "dataType": "NUMERIC",
+         "minValue": 1.0, "maxValue": 5.0, "isArchived": False},  # active match: reuse
+    ]
+    monkeypatch.setattr(c, "list_score_configs", lambda: existing)
+
+    def _boom(spec: ScoreConfigSpec) -> dict[str, object]:
+        raise AssertionError("should not create when an exact active match exists")
+
+    monkeypatch.setattr(c, "create_score_config", _boom)
+    spec = ScoreConfigSpec(name="finds_bug", data_type="NUMERIC", min_value=1.0, max_value=5.0)
+
+    assert c.ensure_score_config(spec) == "good15"
+    c.close()
